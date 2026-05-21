@@ -5,7 +5,7 @@ import json
 from fle.commons.models.technology_state import TechnologyState
 from fle.commons.models.research_state import ResearchState
 from fle.commons.models.achievements import ProductionFlows
-from fle.agents import TaskResponse
+from fle.commons.models.task_response import TaskResponse
 from fle.env.entities import Inventory
 
 
@@ -50,7 +50,6 @@ class CharacterPosition:
 class Observation:
     """Complete observation of the game state"""
 
-    raw_text: str
     entities: List[Dict[str, Any]]  # Entity dicts from Pydantic __dict__
     inventory: Inventory
     research: ResearchState
@@ -59,8 +58,6 @@ class Observation:
     automated_score: float  # Score excluding harvested and manually crafted items
     flows: ProductionFlows
     task_verification: Optional[TaskResponse]
-    messages: List[AgentMessage]
-    serialized_functions: List[Dict[str, Any]]
     task_info: Optional[TaskInfo]
     map_image: str  # Base64 encoded PNG image
     character_positions: List[CharacterPosition]  # Position of each character/agent
@@ -149,17 +146,6 @@ class Observation:
                 },
             )
 
-        # Convert messages
-        messages = [
-            AgentMessage(
-                sender=msg["sender"], content=msg["content"], timestamp=msg["timestamp"]
-            )
-            for msg in obs_dict.get("messages", [])
-        ]
-
-        # Get serialized functions
-        serialized_functions = obs_dict.get("serialized_functions", [])
-
         # Convert task info - task_info dict should always be present now
         task_info = None
         task_dict = obs_dict.get("task_info", {})
@@ -191,8 +177,7 @@ class Observation:
         ]
 
         return cls(
-            raw_text=obs_dict.get("raw_text", ""),
-            entities=entities,  # Now just passing the list of strings
+            entities=entities,
             inventory=inventory,
             research=research,
             game_info=game_info,
@@ -200,8 +185,6 @@ class Observation:
             automated_score=obs_dict.get("automated_score", 0.0),
             flows=flows,
             task_verification=task_verification,
-            messages=messages,
-            serialized_functions=serialized_functions,
             task_info=task_info,
             map_image=map_image,
             character_positions=character_positions,
@@ -230,7 +213,6 @@ class Observation:
         }
 
         return {
-            "raw_text": self.raw_text,
             "map_image": self.map_image,
             "entities": self.entities,
             "inventory": [
@@ -281,27 +263,18 @@ class Observation:
             }
             if self.task_verification
             else {"success": 0, "meta": []},
-            "messages": [
-                {
-                    "sender": msg.sender,
-                    "content": msg.content,
-                    "timestamp": msg.timestamp,
-                }
-                for msg in self.messages
-            ],
-            "serialized_functions": self.serialized_functions,
             "task_info": {
                 "goal_description": self.task_info.goal_description
                 if self.task_info
                 else "",
                 "agent_instructions": (self.task_info.agent_instructions or "")
                 if self.task_info
-                else "",  # Convert None to empty string for gym space
+                else "",
                 "task_key": self.task_info.task_key if self.task_info else "",
                 "trajectory_length": self.task_info.trajectory_length
                 if self.task_info
                 else 0,
-            },  # Always provide a task_info dict, even if empty
+            },
             "character_positions": [
                 {
                     "agent_idx": pos.agent_idx,

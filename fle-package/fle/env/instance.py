@@ -2,11 +2,8 @@ import atexit
 import datetime
 import enum
 import os
-import signal
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import threading
 import time
-from pathlib import Path
 from timeit import default_timer as timer
 from typing import Dict
 
@@ -20,9 +17,6 @@ from fle.env.namespace import FactorioNamespace
 from fle.env.utils.rcon import _lua2python
 from factorio_rcon import RCONClient
 from fle.commons.models.game_state import GameState
-from fle.env.utils.controller_loader.system_prompt_generator import (
-    SystemPromptGenerator,
-)
 from fle.cluster.run_envs import START_RCON_PORT, RCON_PASSWORD
 
 CHUNK_SIZE = 32
@@ -183,6 +177,7 @@ class FactorioInstance:
         num_agents=1,
         reset_speed=10,
         reset_paused=False,
+        save_path: Optional[str] = None,
         **kwargs,
     ):
         self.id = str(uuid.uuid4())[:8]
@@ -193,6 +188,7 @@ class FactorioInstance:
         self.fast = fast
         self._ticks_elapsed = 0
         self._is_initialised = False
+        self.save_path = save_path
 
         self.peaceful = peaceful
         self.namespaces = [self.namespace_class(self, i) for i in range(num_agents)]
@@ -252,7 +248,8 @@ class FactorioInstance:
             atexit.register(self.cleanup)
             FactorioInstance._cleanup_registered = True
 
-        self._executor = ThreadPoolExecutor(max_workers=2)
+        if self.save_path:
+            print(f"Using save file: {self.save_path}")
 
     @property
     def namespace(self):
@@ -363,20 +360,6 @@ class FactorioInstance:
         """Set speed and ensure game is unpaused - common use case"""
         self.game_control.set_speed_and_unpause(speed)
 
-    def get_system_prompt(self, agent_idx: int = 0) -> str:
-        """
-        Get the system prompt for the Factorio environment.
-        This includes all the available actions, objects, and entities that the agent can interact with.
-        We get the system prompt by loading the schema, definitions, and entity definitions from their source files.
-        These are converted to their signatures - leaving out the implementations.
-        :return:
-        """
-        execution_path = Path(os.path.dirname(os.path.realpath(__file__)))
-        generator = SystemPromptGenerator(str(execution_path))
-        return generator.generate_for_agent(
-            agent_idx=agent_idx, num_agents=self.num_agents
-        )
-
     @staticmethod
     def connect_to_server(address, tcp_port):
         try:
@@ -405,96 +388,6 @@ class FactorioInstance:
         print(f"Connected to {address} client at tcp/{tcp_port}.")
         return rcon_client, address
 
-    def __eval_with_error(self, expr, agent_idx=0, timeout=60):
-        """Evaluate an expression with a timeout, and return the result without error handling"""
-
-        def handler(signum, frame):
-            raise TimeoutError()
-
-        signal.signal(signal.SIGALRM, handler)
-        signal.alarm(timeout)
-
-        try:
-            return self.namespaces[agent_idx].eval_with_timeout(expr)
-        finally:
-            signal.alarm(0)
-
-    def eval_with_error(self, expr, agent_idx=0, timeout=60):
-        """Evaluate an expression with a timeout, and return the result without error handling"""
-
-        # Submit the evaluation to the thread pool
-        future = self._executor.submit(
-            self.namespaces[agent_idx].eval_with_timeout, expr
-        )
-
-        try:
-            # Wait for the result with timeout
-            return future.result(timeout=timeout)
-        except FutureTimeoutError:
-            # Cancel the future if it's still running
-            future.cancel()
-            raise TimeoutError()
-        except Exception:
-            # Re-raise any other exceptions
-            raise
-
-    def eval(self, expr, agent_idx=0, timeout=60):
-        "Evaluate several lines of input, returning the result of the last line with a timeout"
-        ctime = time.time()
-        try:
-            response = self.eval_with_error(expr, agent_idx, timeout)
-        except TimeoutError:
-            # Capture partial output from namespace.logging_results
-            partial_output = self._extract_partial_output(agent_idx)
-            timeout_msg = f"Error: Evaluation timed out after {timeout}s"
-            if partial_output:
-                timeout_msg = (
-                    f"{partial_output}\n\nError: Evaluation timed out after {timeout}s"
-                )
-            response = (-1, "", timeout_msg)
-        except Exception as e:
-            message = e.args[0].replace("\\n", "")
-            response = (-1, "", f"{message}".strip())
-        ntime = time.time()
-        duration = ntime - ctime
-        reward, _, result = response
-
-        return reward, duration, result
-
-    def _extract_partial_output(self, agent_idx=0, max_lines=64):
-        """Extract partial output from namespace logging_results after a timeout.
-
-        Mirrors the parse_result_into_str logic from namespace.eval_with_timeout.
-        """
-        try:
-            namespace = self.namespaces[agent_idx]
-            if (
-                not hasattr(namespace, "logging_results")
-                or not namespace.logging_results
-            ):
-                return ""
-
-            result = []
-            execution_trace = getattr(namespace, "execution_trace", False)
-
-            for key, values in namespace.logging_results.items():
-                if execution_trace:
-                    for line_no, value in values:
-                        result.append(f"{line_no}: {value}")
-                else:
-                    for value in values:
-                        result.append(f"{key}: {value}")
-
-            if len(result) > max_lines:
-                truncated_count = len(result) - max_lines
-                result = [f"... {truncated_count} lines truncated ..."] + result[
-                    -max_lines:
-                ]
-
-            return "\n".join(result)
-        except Exception:
-            return ""
-
     def initialise(
         self, fast=True, all_technologies_researched=True, clear_entities=True
     ):
@@ -513,6 +406,10 @@ class FactorioInstance:
         for script_name in init_scripts:
             self.lua_script_manager.load_init_into_game(script_name)
 
+        # Set peaceful flag in Lua storage so remove_enemies knows whether to act
+        self.rcon_client.send_command(
+            f"/sc storage.peaceful = {str(self.peaceful).lower()}"
+        )
         if self.peaceful:
             self.rcon_client.send_command("/sc storage.utils.remove_enemies()")
 
@@ -634,7 +531,3 @@ class FactorioInstance:
                     thread.join(timeout=5)  # Wait up to 5 seconds for each thread
                 except Exception as e:
                     print(f"Error joining thread {thread.name}: {e}")
-
-        # Shutdown the executor
-        if hasattr(self, "_executor"):
-            self._executor.shutdown(wait=True, cancel_futures=True)

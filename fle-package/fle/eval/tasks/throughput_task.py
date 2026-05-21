@@ -4,7 +4,7 @@ from fle.env import FactorioInstance
 from fle.commons.constants import REWARD_OVERRIDE_KEY
 from fle.eval.tasks import TaskABC
 from fle.env.utils.achievements import eval_program_with_achievements
-from fle.agents import TaskResponse
+from fle.commons.models.task_response import TaskResponse
 
 LAB_PLAY_POPULATED_STARTING_INVENTORY = {
     "coal": 500,

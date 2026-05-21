@@ -2,7 +2,7 @@
 Common data models for the Factorio Learning Environment.
 
 This module contains all the core data models used throughout the FLE system,
-including game state management, conversation tracking, research states,
+including game state management, research states,
 and various utility models.
 """
 
@@ -11,13 +11,11 @@ from fle.commons.models.game_state import GameState, filter_serializable_vars
 from fle.commons.models.research_state import ResearchState
 from fle.commons.models.technology_state import TechnologyState
 
-# Conversation and messaging models
-from fle.commons.models.conversation import Conversation
-from fle.commons.models.message import Message
+# Task response model (migrated from fle.agents)
+from fle.commons.models.task_response import TaskResponse
 
 # Program execution models
 from fle.commons.models.program import Program
-from fle.commons.models.serializable_function import SerializableFunction
 
 # Achievement and production models
 from fle.commons.models.achievements import ProfitConfig, ProductionFlows
@@ -37,12 +35,10 @@ __all__ = [
     "ResearchState",
     "TechnologyState",
     "filter_serializable_vars",
-    # Conversation and messaging
-    "Conversation",
-    "Message",
+    # Task response
+    "TaskResponse",
     # Program execution
     "Program",
-    "SerializableFunction",
     # Achievements and production
     "ProfitConfig",
     "ProductionFlows",

@@ -1,5 +1,9 @@
 -- utils.lua
 storage.utils.remove_enemies = function ()
+    -- Only remove enemies if peaceful mode is explicitly enabled
+    if storage.peaceful == false then
+        return  -- Do not remove enemies in non-peaceful (tower defense) mode
+    end
     game.forces["enemy"].kill_all_units()  -- Removes all biters
     game.map_settings.enemy_expansion.enabled = false  -- Stops biters from expanding
     game.map_settings.enemy_evolution.enabled = false  -- Stops biters from evolving
