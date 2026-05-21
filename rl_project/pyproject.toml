@@ -1,0 +1,14 @@
+[project]
+name = "rl-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "a2a-sdk==0.3.26",
+    "factorio-learning-environment[eval]",
+    "google-generativeai>=0.8.6",
+]
+
+[tool.uv.sources]
+factorio-learning-environment = { path = "../fle-package/dist/factorio_learning_environment-0.4.3-py3-none-any.whl" }
