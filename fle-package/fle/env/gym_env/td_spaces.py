@@ -100,3 +100,30 @@ def flatten_action_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.MultiDisc
     return spaces.MultiDiscrete(
         [NUM_ACTION_TYPES, grid_size, grid_size, grid_size, grid_size, 51]
     )
+
+
+class FlatTDActionWrapper(gymnasium.Wrapper):
+    """Wraps TowerDefenseEnv to expose a flat MultiDiscrete action space.
+
+    Order: [action_type, target_x, target_y, source_x, source_y, ammo_amount]
+    Compatible with SB3 PPO / any algorithm that needs a non-Dict action space.
+    """
+
+    def __init__(self, env):
+        super().__init__(env)
+        grid_size = env.unwrapped.grid_size
+        self.action_space = flatten_action_space(grid_size)
+
+    def step(self, action):
+        dict_action = {
+            "action_type": int(action[0]),
+            "target_x": int(action[1]),
+            "target_y": int(action[2]),
+            "source_x": int(action[3]),
+            "source_y": int(action[4]),
+            "ammo_amount": int(action[5]),
+        }
+        return self.env.step(dict_action)
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)

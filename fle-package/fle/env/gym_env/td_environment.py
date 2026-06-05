@@ -104,6 +104,25 @@ class TowerDefenseEnv(gymnasium.Env):
         self.instance.pause()
         self.instance._reset_elapsed_ticks()
 
+        # Anchor the grid center to the player's spawn position
+        try:
+            loc = self.instance.first_namespace.player_location
+            self._center_x = float(loc.x)
+            self._center_y = float(loc.y)
+        except Exception:
+            self._center_x = 0.0
+            self._center_y = 0.0
+
+        # Place radar at the center now that terrain is ready
+        try:
+            from fle.env.game_types import Prototype
+            self.instance.first_namespace.place_entity(
+                Prototype.Radar,
+                position=self.instance.first_namespace.player_location,
+            )
+        except Exception:
+            pass
+
         self._step_count = 0
         self._prev_kills = 0
         self._prev_health = self._get_character_health()

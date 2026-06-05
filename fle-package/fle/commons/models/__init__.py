@@ -14,9 +14,6 @@ from fle.commons.models.technology_state import TechnologyState
 # Task response model (migrated from fle.agents)
 from fle.commons.models.task_response import TaskResponse
 
-# Program execution models
-from fle.commons.models.program import Program
-
 # Achievement and production models
 from fle.commons.models.achievements import ProfitConfig, ProductionFlows
 
@@ -37,8 +34,6 @@ __all__ = [
     "filter_serializable_vars",
     # Task response
     "TaskResponse",
-    # Program execution
-    "Program",
     # Achievements and production
     "ProfitConfig",
     "ProductionFlows",

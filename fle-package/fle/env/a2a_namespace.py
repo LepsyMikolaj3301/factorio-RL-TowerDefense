@@ -1,8 +1,30 @@
 import logging
 from typing import Dict, List, Optional
 
-from a2a.types import AgentCard, Message, Part, TextPart
-from fle.agents.agent_abc import create_default_agent_card
+from a2a.types import AgentCard, AgentCapabilities, AgentSkill, Message, Part, TextPart
+
+
+def _create_default_agent_card(name: str) -> AgentCard:
+    return AgentCard(
+        name=name,
+        version="1.0",
+        description="Factorio RL agent",
+        url="https://github.com/JackHopkins/factorio-learning-environment",
+        capabilities=AgentCapabilities(
+            pushNotifications=False, stateTransitionHistory=False, streaming=False
+        ),
+        defaultInputModes=["text/plain", "application/json"],
+        defaultOutputModes=["text/plain", "application/json"],
+        skills=[
+            AgentSkill(
+                id="factorio_td",
+                name="Tower Defense",
+                description="Play Factorio tower defense via RL policy",
+                tags=["rl", "tower-defense"],
+                examples=[],
+            )
+        ],
+    )
 
 from fle.env.namespace import FactorioNamespace
 from fle.env.protocols.a2a.handler import A2AProtocolHandler
@@ -44,7 +66,7 @@ class A2AFactorioNamespace(FactorioNamespace):
         agent_id_str = self.agent_id
         # Create default agent card if none provided
         if agent_card is None:
-            agent_card = create_default_agent_card(agent_id_str)
+            agent_card = _create_default_agent_card(agent_id_str)
 
         self.a2a_handler = A2AProtocolHandler(
             agent_id=agent_id_str, server_url=server_url, agent_card=agent_card

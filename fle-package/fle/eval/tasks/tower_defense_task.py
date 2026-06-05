@@ -34,15 +34,13 @@ class TowerDefenseTask(TaskABC):
         starting_walls: int = 50,
         starting_turrets: int = 5,
     ):
-        starting_inventory = Inventory(
-            {
-                "firearm-magazine": starting_ammo,
-                "stone-wall": starting_walls,
-                "gun-turret": starting_turrets,
-                "piercing-rounds-magazine": 50,
-                "pistol": 1,
-            }
-        )
+        starting_inventory = Inventory(**{
+            "firearm-magazine": starting_ammo,
+            "stone-wall": starting_walls,
+            "gun-turret": starting_turrets,
+            "piercing-rounds-magazine": 50,
+            "pistol": 1,
+        })
 
         super().__init__(
             trajectory_length=trajectory_length,
@@ -58,6 +56,12 @@ class TowerDefenseTask(TaskABC):
         self.starting_turrets = starting_turrets
 
     def setup_instance(self, instance: FactorioInstance):
+        # Anchor radar to player spawn position
+        try:
+            loc = instance.first_namespace.player_location
+            self.radar_position = Position(x=float(loc.x), y=float(loc.y))
+        except Exception:
+            pass
         """Place radar at the center position."""
         ns = instance.first_namespace
 

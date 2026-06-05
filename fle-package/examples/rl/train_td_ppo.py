@@ -34,7 +34,7 @@ def main():
         return
 
     from fle.env.gym_env.td_vector import make_td_vector_env
-    from fle.env.gym_env.action_mask import ActionMaskWrapper
+    from fle.env.gym_env.td_spaces import FlatTDActionWrapper
     from fle.env.gym_env.registry import make_td_env
 
     if args.num_envs > 1:
@@ -44,7 +44,7 @@ def main():
         )
     else:
         env = make_td_env(save_path=args.save_path)
-        env = ActionMaskWrapper(env)
+        env = FlatTDActionWrapper(env)
 
     model = PPO(
         "MultiInputPolicy",
