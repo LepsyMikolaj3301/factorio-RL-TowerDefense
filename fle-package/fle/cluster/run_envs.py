@@ -102,13 +102,22 @@ class ComposeGenerator:
         if self.save_file:
             # Use only the basename inside the command
             launch_command = f"--start-server {Path(self.save_file).name}"
+
+        # Select config files based on scenario
+        if self.scenario == "tower_defense":
+            map_gen_settings = "/opt/factorio/config/map-gen-settings.td.json"
+            map_settings = "/opt/factorio/config/map-settings.td.json"
+        else:
+            map_gen_settings = "/opt/factorio/config/map-gen-settings.json"
+            map_settings = "/opt/factorio/config/map-settings.json"
+
         args = [
             f"--port {self.internal_game_port}",
             f"--rcon-port {self.internal_rcon_port}",
             f"--rcon-password {self.rcon_password}",
             "--server-settings /opt/factorio/config/server-settings.json",
-            "--map-gen-settings /opt/factorio/config/map-gen-settings.json",
-            "--map-settings /opt/factorio/config/map-settings.json",
+            f"--map-gen-settings {map_gen_settings}",
+            f"--map-settings {map_settings}",
             "--server-adminlist /opt/factorio/config/server-adminlist.json",
             "--server-banlist /opt/factorio/config/server-banlist.json",
             "--server-whitelist /opt/factorio/config/server-whitelist.json",

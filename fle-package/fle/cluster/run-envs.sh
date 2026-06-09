@@ -83,8 +83,8 @@ generate_compose_file() {
     fi
     
     # Validate scenario
-    if [ "$SCENARIO" != "open_world" ] && [ "$SCENARIO" != "default_lab_scenario" ]; then
-        echo "Error: Scenario must be either 'open_world' or 'default_lab_scenario'."
+    if [ "$SCENARIO" != "open_world" ] && [ "$SCENARIO" != "default_lab_scenario" ] && [ "$SCENARIO" != "tower_defense" ]; then
+        echo "Error: Scenario must be one of: open_world, default_lab_scenario, tower_defense."
         exit 1
     fi
     

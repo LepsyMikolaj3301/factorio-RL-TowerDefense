@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, Optional
 from fle.env import FactorioInstance
 from fle.eval.tasks import TaskABC
-from fle.agents import TaskResponse
+from fle.commons.models.task_response import TaskResponse
 
 
 class DefaultTask(TaskABC):

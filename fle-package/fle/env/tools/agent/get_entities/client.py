@@ -3,7 +3,7 @@ from typing import List, Set, Union
 
 from fle.env.entities import Position, Entity, EntityGroup
 from fle.env.game_types import Prototype
-from fle.env.tools.agent.connect_entities.groupable_entities import (
+from fle.env.tools.agent.get_entities.groupable_entities import (
     agglomerate_groupable_entities,
 )
 from fle.env.tools import Tool

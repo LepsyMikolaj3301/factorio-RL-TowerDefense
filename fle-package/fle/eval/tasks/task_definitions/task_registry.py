@@ -35,6 +35,7 @@ from fle.eval.tasks import (
     DefaultTask,
     TaskABC,
 )
+from fle.eval.tasks.tower_defense_task import TowerDefenseTask
 
 
 class TaskRegistry:
@@ -62,7 +63,7 @@ class TaskRegistry:
             "throughput": ThroughputTask,
             "unbounded_throughput": UnboundedThroughputTask,
             "default": DefaultTask,
-            # "unbounded_production" is handled by Inspect framework, not TaskABC
+            "tower_defense": TowerDefenseTask,
         }
 
     def get_task_config(self, task_key: str) -> BaseModel:
