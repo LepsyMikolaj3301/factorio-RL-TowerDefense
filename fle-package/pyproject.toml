@@ -89,6 +89,9 @@ packages = ["fle"]
 pythonpath = "fle/env"
 testpaths = "tests"
 python_files = "test_*.py"
+markers = [
+    "integration: marks tests as requiring a live Factorio server (deselect with -m 'not integration')",
+]
 
 [project.urls]
 homepage = "https://jackhopkins.github.io/factorio-learning-environment/"

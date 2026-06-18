@@ -9,7 +9,7 @@ from fle.env.gym_env.registry import list_available_environments
 
 from fle.env.protocols._mcp.models import FactorioServer, Recipe, ResourcePatch
 from fle.env.protocols._mcp.repository import FactorioMCPRepository
-import gym
+import gymnasium as gym
 
 
 class FactorioMCPState:
@@ -55,15 +55,6 @@ class FactorioMCPState:
             # print(f"DEBUG: No open environment found, using first available: {env_ids[0]}")
             self.gym_env = gym.make(env_ids[0], run_idx=0)
 
-            # program = await self.create_program_from_policy(
-            #     policy=policy,
-            #     agent_idx=agent_idx,
-            #     reward=reward,
-            #     response=obs_dict["raw_text"],
-            #     error_occurred=info["error_occurred"],
-            #     game_state=output_game_state
-            # )
-            #
         except IndexError as e:
             print(f"IndexError in __init__: {e}")
             print(

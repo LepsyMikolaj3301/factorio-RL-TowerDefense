@@ -131,5 +131,5 @@ storage.actions.radar_view = function(player_index, center_x, center_y, radius, 
         end
     end
 
-    rcon.print("b64:" .. table.concat(result))
+    return "b64:" .. table.concat(result)
 end

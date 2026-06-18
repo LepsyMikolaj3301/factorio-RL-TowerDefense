@@ -53,4 +53,5 @@ class TestTDEnvironmentSpaces:
         obs_space = make_observation_space(grid_size=gs)
         act_space = make_action_space(grid_size=gs)
         assert obs_space["map"].shape == (NUM_CHANNELS, gs, gs)
-        assert act_space["target_x"].n == gs
+        # The action space is slot-based and independent of grid size.
+        assert "slot_index" in act_space.spaces

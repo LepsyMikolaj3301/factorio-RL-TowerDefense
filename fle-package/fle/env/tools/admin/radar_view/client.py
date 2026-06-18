@@ -40,10 +40,16 @@ class RadarView(Tool):
         :param charted_only: Only include entities in charted chunks
         :return: numpy uint8 array of shape (NUM_CHANNELS, H, W)
         """
-        response, _ = self.execute(
-            self.player_index, center_x, center_y, radius, cell_size, charted_only
+        # The grid is a large base64 payload (tens of KB). The standard
+        # execute() path wraps the call in pcall + dump({a, b}), whose table
+        # serialisation cannot round-trip a payload this large. So we invoke the
+        # action directly and read its printed return value over RCON instead.
+        cmd = (
+            "/silent-command rcon.print(storage.actions.radar_view("
+            f"{self.player_index}, {float(center_x)}, {float(center_y)}, "
+            f"{int(radius)}, {float(cell_size)}, {str(bool(charted_only)).lower()}))"
         )
-        cleaned = self.clean_response(response)
+        cleaned = self.connection.rcon_client.send_command(cmd)
 
         if isinstance(cleaned, str) and cleaned.startswith("b64:"):
             grid_size = int(2 * radius / cell_size)

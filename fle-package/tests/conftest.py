@@ -115,10 +115,16 @@ def instance(pytestconfig, worker_id):
 
 # # Reset state between tests without recreating the instance
 @pytest.fixture(autouse=True)
-def _reset_between_tests(instance, request):
+def _reset_between_tests(request):
     """
     Ensure clean state between tests without reloading Lua/scripts.
+    Only runs for tests that actually use the Factorio instance.
     """
+    # Skip entirely for unit tests that don't need a live server.
+    if not any(f in request.fixturenames for f in ("instance", "namespace", "game", "configure_game")):
+        yield
+        return
+    instance = request.getfixturevalue("instance")
     # If this test explicitly uses `configure_game`, let that fixture perform
     # the reset to avoid double resets and allow per-test options.
     if "configure_game" in getattr(request, "fixturenames", []):

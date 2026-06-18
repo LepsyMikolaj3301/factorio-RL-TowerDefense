@@ -6,19 +6,16 @@ from typing import Any, Dict, Optional, Tuple
 import gymnasium
 import numpy as np
 
+from fle.commons.models.game_state import GameState
 from fle.env import FactorioInstance
+from fle.env.gym_env.td_config import TDScenarioConfig
 from fle.env.gym_env.td_spaces import (
     ACTION_NOOP,
-    ACTION_PLACE_WALL,
     ACTION_PLACE_TURRET,
-    ACTION_MOVE_WALL,
-    ACTION_MOVE_TURRET,
     ACTION_REFILL_TURRET,
-    ACTION_SHOOT,
-    DEFAULT_GRID_SIZE,
-    MAX_TURRETS,
-    MAX_WALLS,
+    MAX_SLOTS,
     NUM_CHANNELS,
+    SLOT_FEATURES,
     TRACKED_ITEMS,
     make_action_space,
     make_observation_space,
@@ -35,6 +32,9 @@ class TowerDefenseEnv(gymnasium.Env):
 
     The agent defends a radar from waves of biters using walls, turrets,
     and direct shooting. Observation is a symbolic grid + structured data.
+
+    Pass a TDScenarioConfig to tune difficulty:
+        env = TowerDefenseEnv(instance, config=TDScenarioConfig.HARD)
     """
 
     metadata = {"render_modes": ["human"], "render_fps": 30}
@@ -42,53 +42,48 @@ class TowerDefenseEnv(gymnasium.Env):
     def __init__(
         self,
         instance: FactorioInstance,
-        grid_size: int = DEFAULT_GRID_SIZE,
-        cell_size: float = 1.0,
-        decision_cadence: int = 60,
-        max_ticks: int = 108000,  # 30 minutes at 60 ticks/sec
-        game_speed: float = 10.0,
-        # Reward coefficients
-        alpha_survive: float = 0.01,
-        beta_kills: float = 1.0,
-        gamma_ammo: float = 0.1,
-        delta_damage: float = 0.5,
-        epsilon_invalid: float = 0.5,
-        terminal_bonus: float = 100.0,
-        terminal_penalty: float = -100.0,
+        config: Optional[TDScenarioConfig] = None,
         render_mode: Optional[str] = None,
     ):
         super().__init__()
 
         self.instance = instance
-        self.grid_size = grid_size
-        self.cell_size = cell_size
-        self.decision_cadence = decision_cadence
-        self.max_ticks = max_ticks
-        self.game_speed = game_speed
+        self.config = config or TDScenarioConfig.MEDIUM
         self.render_mode = render_mode
 
-        # Reward coefficients
-        self.alpha = alpha_survive
-        self.beta = beta_kills
-        self.gamma = gamma_ammo
-        self.delta = delta_damage
-        self.epsilon = epsilon_invalid
-        self.terminal_bonus = terminal_bonus
-        self.terminal_penalty = terminal_penalty
+        # Convenience aliases for readability inside the class
+        cfg = self.config
+        self.grid_size = cfg.grid_size
+        self.cell_size = 1.0
+        self.decision_cadence = cfg.decision_cadence
+        self.max_ticks = cfg.max_ticks
+        self.game_speed = cfg.game_speed
+        self.max_slots = min(cfg.max_turret_slots, MAX_SLOTS)
+
+        # Distance (tiles) within which a live turret is considered to occupy a
+        # slot, or two read positions are considered the same slot.
+        self._slot_epsilon = 0.6
 
         # Spaces
-        self.observation_space = make_observation_space(grid_size)
-        self.action_space = make_action_space(grid_size)
+        self.observation_space = make_observation_space(self.grid_size)
+        self.action_space = make_action_space(self.grid_size)
 
         # Internal state
         self._step_count = 0
         self._prev_kills = 0
         self._prev_health = 0.0
         self._wave_number = 0
-        self._ticks_per_wave = 3600  # 60 seconds per wave
         self._center_x = 0.0
         self._center_y = 0.0
-        self._radius = grid_size * cell_size / 2.0
+        self._radius = self.grid_size * self.cell_size / 2.0
+
+        # Canonical turret slots, read once from the map on first reset.
+        # Shape (N, 2): the (x, y) center of every slot. Never changes for a run.
+        self._turret_slots: Optional[np.ndarray] = None
+
+        # Save-state reset
+        self._initial_snapshot: Optional[GameState] = None
+        self._initial_evolution_factor: float = 0.0
 
     def reset(
         self,
@@ -98,30 +93,67 @@ class TowerDefenseEnv(gymnasium.Env):
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         super().reset(seed=seed)
 
-        # Reset the Factorio instance
-        self.instance.reset()
-        self.instance.set_speed(self.game_speed)
-        self.instance.pause()
-        self.instance._reset_elapsed_ticks()
+        if self._initial_snapshot is None:
+            # First reset: server already loaded the save file.
+            # Configure the running game, then capture the snapshot.
+            self.instance.set_speed(self.game_speed)
+            self.instance.pause()
+            self.instance._reset_elapsed_ticks()
 
-        # Anchor the grid center to the player's spawn position
-        try:
-            loc = self.instance.first_namespace.player_location
-            self._center_x = float(loc.x)
-            self._center_y = float(loc.y)
-        except Exception:
-            self._center_x = 0.0
-            self._center_y = 0.0
+            try:
+                loc = self.instance.first_namespace.player_location
+                self._center_x = float(loc.x)
+                self._center_y = float(loc.y)
+            except Exception:
+                self._center_x = 0.0
+                self._center_y = 0.0
 
-        # Place radar at the center now that terrain is ready
-        try:
-            from fle.env.game_types import Prototype
-            self.instance.first_namespace.place_entity(
-                Prototype.Radar,
-                position=self.instance.first_namespace.player_location,
-            )
-        except Exception:
-            pass
+            try:
+                self.instance.first_namespace.place_entity(
+                    Prototype.Radar,
+                    position=self.instance.first_namespace.player_location,
+                )
+            except Exception:
+                pass
+
+            # If the map ships without turrets, seed them from config so the
+            # slot system still has positions to work with.
+            self._seed_turret_positions_if_needed()
+
+            # Read the canonical slot geometry from every turret on the map.
+            self._read_turret_slots()
+
+            # Capture the snapshot with ALL slot turrets present, so each episode
+            # restores the full set before re-rolling which slots start empty.
+            self._capture_save_state()
+
+        else:
+            # Subsequent resets: wipe and restore from snapshot.
+            self.instance.reset(game_state=self._initial_snapshot)
+            self._restore_evolution_factor()
+            self.instance.set_speed(self.game_speed)
+            self.instance.pause()
+            self.instance._reset_elapsed_ticks()
+
+            try:
+                loc = self.instance.first_namespace.player_location
+                self._center_x = float(loc.x)
+                self._center_y = float(loc.y)
+            except Exception:
+                self._center_x = 0.0
+                self._center_y = 0.0
+
+            # Radar is restored by _load_entity_state; place_entity no-ops on collision.
+            try:
+                self.instance.first_namespace.place_entity(
+                    Prototype.Radar,
+                    position=self.instance.first_namespace.player_location,
+                )
+            except Exception:
+                pass
+
+        # Re-roll which slots start empty for this episode (seeded by reset seed).
+        self._delete_turret_subset()
 
         self._step_count = 0
         self._prev_kills = 0
@@ -131,6 +163,121 @@ class TowerDefenseEnv(gymnasium.Env):
         obs = self._get_observation()
         info = {"step": 0, "elapsed_ticks": 0, "wave": 0}
         return obs, info
+
+    def _capture_save_state(self) -> None:
+        self._initial_snapshot = GameState.from_instance(self.instance)
+        raw = self.instance.rcon_client.send_command(
+            "/sc rcon.print(game.forces['player'].evolution_factor)"
+        )
+        try:
+            self._initial_evolution_factor = float(raw.strip())
+        except (ValueError, AttributeError):
+            self._initial_evolution_factor = 0.0
+
+    def _restore_evolution_factor(self) -> None:
+        self.instance.rcon_client.send_command(
+            f"/sc game.forces['player'].evolution_factor = {self._initial_evolution_factor}"
+        )
+
+    # ------------------------------------------------------------------
+    # Turret slot management
+    # ------------------------------------------------------------------
+    def _current_turrets(self) -> list:
+        """Return current gun-turrets as a list of (x, y, ammo, health)."""
+        ns = self.instance.first_namespace
+        turrets = []
+        try:
+            entities = ns.get_entities(
+                position=Position(x=self._center_x, y=self._center_y),
+                radius=self._radius,
+            )
+            for e in entities:
+                if e.name == "gun-turret":
+                    turrets.append(
+                        (
+                            float(e.position.x),
+                            float(e.position.y),
+                            float(getattr(e, "ammo_count", 0) or 0),
+                            float(getattr(e, "health", 0) or 0),
+                        )
+                    )
+        except Exception:
+            pass
+        return turrets
+
+    def _seed_turret_positions_if_needed(self) -> None:
+        """Place turrets at configured positions if the map ships with none."""
+        positions = self.config.turret_slot_positions
+        if not positions:
+            return
+        if self._current_turrets():
+            return  # Map already has turrets; trust the map's layout.
+        ns = self.instance.first_namespace
+        for (px, py) in positions:
+            try:
+                ns.place_entity(
+                    Prototype.GunTurret,
+                    Direction.UP,
+                    Position(x=float(px), y=float(py)),
+                )
+            except Exception as e:
+                logger.debug(f"Could not seed turret at ({px},{py}): {e}")
+
+    def _read_turret_slots(self) -> None:
+        """Read every turret center on the map into the canonical slot list."""
+        slots: list = []
+        for (x, y, _ammo, _health) in self._current_turrets():
+            # Dedup positions that fall within epsilon of an existing slot.
+            is_dup = any(
+                abs(x - sx) <= self._slot_epsilon and abs(y - sy) <= self._slot_epsilon
+                for (sx, sy) in slots
+            )
+            if not is_dup and len(slots) < self.max_slots:
+                slots.append((x, y))
+        self._turret_slots = np.array(slots, dtype=np.float32).reshape(-1, 2)
+        if len(slots) == 0:
+            logger.warning(
+                "No turrets found on map and no turret_slot_positions configured; "
+                "the agent will have no slots to act on."
+            )
+
+    def _delete_turret_subset(self) -> None:
+        """Destroy a seeded random subset of slot turrets for this episode."""
+        if self._turret_slots is None or len(self._turret_slots) == 0:
+            return
+        n = len(self._turret_slots)
+        pct = max(0.0, min(1.0, self.config.turret_deletion_percentage))
+        n_delete = int(np.floor(n * pct))
+        if n_delete <= 0:
+            return
+        idx = self.np_random.choice(n, size=n_delete, replace=False)
+        positions = [
+            (float(self._turret_slots[i][0]), float(self._turret_slots[i][1]))
+            for i in idx
+        ]
+        try:
+            self.instance.first_namespace._destroy_turrets(positions=positions)
+        except Exception as e:
+            logger.warning(f"Failed to delete turret subset: {e}")
+
+    def _slot_occupancy(self, turrets: list) -> Tuple[np.ndarray, np.ndarray]:
+        """Match canonical slots against live turrets.
+
+        Returns (occupied, slot_features) where occupied is a bool array of
+        length N and slot_features is (N, 3) of [occupied(0/1), ammo, health].
+        """
+        n = 0 if self._turret_slots is None else len(self._turret_slots)
+        occupied = np.zeros(n, dtype=bool)
+        features = np.zeros((n, 3), dtype=np.float32)
+        eps = self._slot_epsilon
+        for i in range(n):
+            sx, sy = self._turret_slots[i]
+            for (tx, ty, ammo, health) in turrets:
+                if abs(tx - sx) <= eps and abs(ty - sy) <= eps:
+                    occupied[i] = True
+                    features[i] = [1.0, ammo, health]
+                    break
+        return occupied, features
 
     def step(
         self, action: Dict[str, Any]
@@ -142,7 +289,6 @@ class TowerDefenseEnv(gymnasium.Env):
 
         # Unpause, let game run for decision_cadence ticks, then pause
         self.instance.unpause()
-        # Wait for ticks by sending a sleep command through RCON
         sleep_seconds = self.decision_cadence / 60.0 / self.game_speed
         if sleep_seconds > 0:
             import time
@@ -151,7 +297,7 @@ class TowerDefenseEnv(gymnasium.Env):
 
         # Check wave spawning
         elapsed_ticks = self.instance.get_elapsed_ticks()
-        new_wave = int(elapsed_ticks / self._ticks_per_wave)
+        new_wave = int(elapsed_ticks / self.config.ticks_per_wave)
         if new_wave > self._wave_number:
             self._wave_number = new_wave
             self._spawn_wave()
@@ -167,9 +313,9 @@ class TowerDefenseEnv(gymnasium.Env):
         truncated = elapsed_ticks >= self.max_ticks
 
         if terminated:
-            reward += self.terminal_penalty
+            reward += self.config.terminal_penalty
         elif truncated:
-            reward += self.terminal_bonus
+            reward += self.config.terminal_bonus
 
         info = {
             "step": self._step_count,
@@ -181,93 +327,45 @@ class TowerDefenseEnv(gymnasium.Env):
         return obs, reward, terminated, truncated, info
 
     def _execute_action(self, action: Dict[str, Any]) -> bool:
-        """Execute the given action. Returns True if the action was invalid."""
+        """Execute the given slot-based action. Returns True if invalid."""
         action_type = int(action.get("action_type", ACTION_NOOP))
-        target_x = int(action.get("target_x", 0))
-        target_y = int(action.get("target_y", 0))
-        source_x = int(action.get("source_x", 0))
-        source_y = int(action.get("source_y", 0))
+        slot_index = int(action.get("slot_index", 0))
         ammo_amount = int(action.get("ammo_amount", 0))
 
-        # Convert grid coords to world coords
-        world_tx = self._center_x - self._radius + target_x * self.cell_size
-        world_ty = self._center_y - self._radius + target_y * self.cell_size
-        world_sx = self._center_x - self._radius + source_x * self.cell_size
-        world_sy = self._center_y - self._radius + source_y * self.cell_size
+        if action_type == ACTION_NOOP:
+            return False
+
+        # Resolve the slot index to a real slot center.
+        n = 0 if self._turret_slots is None else len(self._turret_slots)
+        if slot_index < 0 or slot_index >= n:
+            return True  # padding / out-of-range slot
+        slot_x = float(self._turret_slots[slot_index][0])
+        slot_y = float(self._turret_slots[slot_index][1])
 
         ns = self.instance.first_namespace
+        # Is there a live turret in this slot right now?
+        turret_here = self._find_turret_at(slot_x, slot_y)
 
         try:
-            if action_type == ACTION_NOOP:
-                return False
-
-            elif action_type == ACTION_PLACE_WALL:
-                ns.place_entity(
-                    Prototype.Wall,
-                    Direction.UP,
-                    Position(x=world_tx, y=world_ty),
-                )
-                return False
-
-            elif action_type == ACTION_PLACE_TURRET:
+            if action_type == ACTION_PLACE_TURRET:
+                if turret_here is not None:
+                    return True  # slot already occupied
                 ns.place_entity(
                     Prototype.GunTurret,
                     Direction.UP,
-                    Position(x=world_tx, y=world_ty),
+                    Position(x=slot_x, y=slot_y),
                 )
                 return False
 
-            elif action_type == ACTION_MOVE_WALL:
-                # Pick up from source and place at target
-                entities = ns.get_entities(
-                    position=Position(x=world_sx, y=world_sy),
-                    radius=1.0,
-                )
-                for e in entities:
-                    if e.name == "stone-wall":
-                        ns.pickup_entity(e)
-                        ns.place_entity(
-                            Prototype.Wall,
-                            Direction.UP,
-                            Position(x=world_tx, y=world_ty),
-                        )
-                        return False
-                return True  # No wall found at source
-
-            elif action_type == ACTION_MOVE_TURRET:
-                entities = ns.get_entities(
-                    position=Position(x=world_sx, y=world_sy),
-                    radius=1.0,
-                )
-                for e in entities:
-                    if e.name == "gun-turret":
-                        ns.pickup_entity(e)
-                        ns.place_entity(
-                            Prototype.GunTurret,
-                            Direction.UP,
-                            Position(x=world_tx, y=world_ty),
-                        )
-                        return False
-                return True  # No turret found at source
-
             elif action_type == ACTION_REFILL_TURRET:
-                entities = ns.get_entities(
-                    position=Position(x=world_tx, y=world_ty),
-                    radius=1.0,
+                if turret_here is None:
+                    return True  # empty slot, nothing to refill
+                amount = max(1, ammo_amount)
+                ns.insert_item(
+                    Prototype.FirearmMagazine,
+                    turret_here,
+                    amount,
                 )
-                for e in entities:
-                    if e.name == "gun-turret":
-                        amount = max(1, ammo_amount)
-                        ns.insert_item(
-                            Prototype.FirearmMagazine,
-                            e,
-                            amount,
-                        )
-                        return False
-                return True  # No turret at target
-
-            elif action_type == ACTION_SHOOT:
-                ns._shoot(world_tx, world_ty, self.decision_cadence)
                 return False
 
             else:
@@ -277,6 +375,21 @@ class TowerDefenseEnv(gymnasium.Env):
             logger.debug(f"Action failed: {e}")
             return True
 
+    def _find_turret_at(self, x: float, y: float):
+        """Return the gun-turret entity occupying slot (x, y), or None."""
+        ns = self.instance.first_namespace
+        try:
+            entities = ns.get_entities(
+                position=Position(x=x, y=y),
+                radius=self._slot_epsilon,
+            )
+            for e in entities:
+                if e.name == "gun-turret":
+                    return e
+        except Exception:
+            pass
+        return None
+
     def _spawn_wave(self):
         """Spawn a wave of enemies using biter_director."""
         try:
@@ -285,8 +398,8 @@ class TowerDefenseEnv(gymnasium.Env):
                 center_x=self._center_x,
                 center_y=self._center_y,
                 spawn_radius=self._radius * 1.5,
-                base_count=5,
-                escalation_factor=1.5,
+                base_count=self.config.base_enemy_count,
+                escalation_factor=self.config.escalation_factor,
             )
         except Exception as e:
             logger.warning(f"Failed to spawn wave {self._wave_number}: {e}")
@@ -322,40 +435,44 @@ class TowerDefenseEnv(gymnasium.Env):
         except Exception:
             inv_arr = np.zeros(len(TRACKED_ITEMS), dtype=np.int32)
 
-        # Turrets
-        turrets_arr = np.zeros((MAX_TURRETS, 4), dtype=np.float32)
+        # Entities (used for turret occupancy and the radar lookup)
+        entities = []
         try:
             entities = ns.get_entities(
                 position=Position(x=self._center_x, y=self._center_y),
                 radius=self._radius,
             )
-            turret_idx = 0
-            for e in entities:
-                if e.name == "gun-turret" and turret_idx < MAX_TURRETS:
-                    turrets_arr[turret_idx] = [
-                        e.position.x,
-                        e.position.y,
-                        getattr(e, "ammo_count", 0),
-                        getattr(e, "health", 0),
-                    ]
-                    turret_idx += 1
         except Exception:
             pass
+        turrets = [
+            (
+                float(e.position.x),
+                float(e.position.y),
+                float(getattr(e, "ammo_count", 0) or 0),
+                float(getattr(e, "health", 0) or 0),
+            )
+            for e in entities
+            if getattr(e, "name", None) == "gun-turret"
+        ]
 
-        # Walls
-        walls_arr = np.zeros((MAX_WALLS, 3), dtype=np.float32)
-        try:
-            wall_idx = 0
-            for e in entities:
-                if e.name == "stone-wall" and wall_idx < MAX_WALLS:
-                    walls_arr[wall_idx] = [
-                        e.position.x,
-                        e.position.y,
-                        getattr(e, "health", 0),
-                    ]
-                    wall_idx += 1
-        except Exception:
-            pass
+        # Turret slots + masks
+        slots_arr = np.zeros((MAX_SLOTS, SLOT_FEATURES), dtype=np.float32)
+        slot_valid_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
+        place_slot_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
+        refill_slot_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
+        # Mark padding rows as occupied = -1
+        slots_arr[:, 2] = -1.0
+        n = 0 if self._turret_slots is None else len(self._turret_slots)
+        if n > 0:
+            occupied, feats = self._slot_occupancy(turrets)
+            for i in range(min(n, MAX_SLOTS)):
+                sx, sy = self._turret_slots[i]
+                slots_arr[i] = [sx, sy, feats[i][0], feats[i][1], feats[i][2]]
+                slot_valid_mask[i] = 1
+                if occupied[i]:
+                    refill_slot_mask[i] = 1
+                else:
+                    place_slot_mask[i] = 1
 
         # Character
         char_arr = np.zeros(4, dtype=np.float32)
@@ -389,8 +506,10 @@ class TowerDefenseEnv(gymnasium.Env):
         return {
             "map": map_grid,
             "inventory": inv_arr,
-            "turrets": turrets_arr,
-            "walls": walls_arr,
+            "turret_slots": slots_arr,
+            "slot_valid_mask": slot_valid_mask,
+            "place_slot_mask": place_slot_mask,
+            "refill_slot_mask": refill_slot_mask,
             "character": char_arr,
             "radar": radar_arr,
             "game": game_arr,
@@ -418,35 +537,34 @@ class TowerDefenseEnv(gymnasium.Env):
 
     def _compute_reward(self, invalid: bool) -> float:
         """Compute step reward."""
+        cfg = self.config
         reward = 0.0
 
         # Survival bonus
-        reward += self.alpha
+        reward += cfg.alpha_survive
 
         # Kill bonus
         kills = self._get_kill_count()
         delta_kills = kills - self._prev_kills
         self._prev_kills = kills
-        reward += self.beta * delta_kills
+        reward += cfg.beta_kills * delta_kills
 
         # Damage penalty
         health = self._get_character_health()
         damage_taken = max(0, self._prev_health - health)
         self._prev_health = health
-        reward -= self.delta * damage_taken
+        reward -= cfg.delta_damage * damage_taken
 
         # Invalid action penalty
         if invalid:
-            reward -= self.epsilon
+            reward -= cfg.epsilon_invalid
 
         return reward
 
     def _check_terminated(self, obs: Dict[str, np.ndarray]) -> bool:
         """Check if episode should terminate."""
-        # Radar destroyed
         if obs["radar"][2] <= 0 and self._step_count > 1:
             return True
-        # Character dead
         if obs["character"][2] <= 0 and self._step_count > 1:
             return True
         return False

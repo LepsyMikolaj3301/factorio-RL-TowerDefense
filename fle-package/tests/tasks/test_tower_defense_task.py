@@ -18,21 +18,30 @@ class TestTowerDefenseTask:
     def test_custom_params(self):
         task = TowerDefenseTask(
             trajectory_length=3600,
-            starting_ammo=200,
-            starting_walls=100,
-            starting_turrets=10,
+            starting_inventory_dict={
+                "firearm-magazine": 200,
+                "stone-wall": 100,
+                "gun-turret": 10,
+            },
         )
         assert task.trajectory_length == 3600
-        assert task.starting_ammo == 200
+        assert task.starting_inventory["firearm-magazine"] == 200
 
     def test_starting_inventory_contents(self):
-        task = TowerDefenseTask(starting_ammo=50, starting_walls=20, starting_turrets=3)
+        task = TowerDefenseTask(
+            starting_inventory_dict={
+                "firearm-magazine": 50,
+                "stone-wall": 20,
+                "gun-turret": 3,
+                "piercing-rounds-magazine": 50,
+            }
+        )
         inv = task.starting_inventory
         assert inv["firearm-magazine"] == 50
         assert inv["stone-wall"] == 20
         assert inv["gun-turret"] == 3
         assert inv["piercing-rounds-magazine"] == 50
-        assert inv["pistol"] == 1
+        assert inv["pistol"] == 1  # always injected
 
     def test_verify_returns_task_response(self):
         task = TowerDefenseTask()

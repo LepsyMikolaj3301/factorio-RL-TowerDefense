@@ -82,8 +82,10 @@ class Controller:
 
         cleaned_response = {}
 
+        # Scalars / strings (e.g. radar_view's base64 grid, spawn_enemy's count)
+        # have no .items(); pass them through unchanged.
         if not hasattr(response, "items"):
-            pass
+            return response
 
         for key, value in response.items():
             # if key == 'status' and isinstance(value, str):

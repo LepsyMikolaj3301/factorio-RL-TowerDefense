@@ -17,9 +17,6 @@ from fle.commons.models.task_response import TaskResponse
 # Achievement and production models
 from fle.commons.models.achievements import ProfitConfig, ProductionFlows
 
-# Generation and configuration models
-from fle.commons.models.generation_parameters import GenerationParameters
-
 # Timing and metrics models
 from fle.commons.models.timing_metrics import TimingMetrics
 
@@ -37,8 +34,6 @@ __all__ = [
     # Achievements and production
     "ProfitConfig",
     "ProductionFlows",
-    # Generation and configuration
-    "GenerationParameters",
     # Timing and metrics
     "TimingMetrics",
     # Rendering

@@ -110,11 +110,23 @@ def _get_factorio_connection(run_idx: int = 0):
 def make_td_env(
     run_idx: int = 0,
     save_path: Optional[str] = None,
+    config=None,
     **kwargs,
 ):
-    """Create a Tower Defense gymnasium environment."""
+    """Create a Tower Defense gymnasium environment.
+
+    Args:
+        run_idx: Container index for multi-env setups.
+        save_path: Optional path to a prebuilt Factorio save.
+        config: TDScenarioConfig instance (defaults to MEDIUM).
+        **kwargs: Additional kwargs forwarded to TowerDefenseEnv.
+    """
+    from fle.env.gym_env.td_config import TDScenarioConfig
     from fle.env.gym_env.td_environment import TowerDefenseEnv
     from fle.eval.tasks.tower_defense_task import TowerDefenseTask
+
+    if config is None:
+        config = TDScenarioConfig.MEDIUM
 
     address, tcp_port = _get_factorio_connection(run_idx)
 
@@ -130,10 +142,10 @@ def make_td_env(
         save_path=save_path,
     )
 
-    task = TowerDefenseTask()
+    task = TowerDefenseTask(starting_inventory_dict=config.starting_inventory)
     task.setup(instance)
 
-    env = TowerDefenseEnv(instance=instance, **kwargs)
+    env = TowerDefenseEnv(instance=instance, config=config, **kwargs)
     return env
 
 

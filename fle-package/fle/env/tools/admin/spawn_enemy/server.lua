@@ -10,8 +10,7 @@ storage.actions.spawn_enemy = function(player_index, entity_type, x, y, count)
     }
 
     if not valid_types[entity_type] then
-        rcon.print("Invalid enemy type: " .. tostring(entity_type))
-        return
+        return "Invalid enemy type: " .. tostring(entity_type)
     end
 
     count = count or 1
@@ -28,5 +27,5 @@ storage.actions.spawn_enemy = function(player_index, entity_type, x, y, count)
             spawned = spawned + 1
         end
     end
-    rcon.print(spawned)
+    return spawned
 end
