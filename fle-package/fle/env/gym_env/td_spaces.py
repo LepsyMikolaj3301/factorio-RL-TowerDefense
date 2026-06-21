@@ -11,13 +11,15 @@ import gymnasium
 from gymnasium import spaces
 
 # --- Action constants ---
-# The action set is deliberately limited to the two meaningful turret decisions
-# (where to place, where to feed ammo) plus a no-op. Walls and direct shooting
-# are intentionally not exposed to the policy.
+# The action set is limited to the three meaningful turret decisions
+# (pick a turret up, place one down, feed ammo to one) plus a no-op. Walls and
+# direct shooting are intentionally not exposed to the policy.
 ACTION_NOOP = 0
-ACTION_PLACE_TURRET = 1
-ACTION_REFILL_TURRET = 2
-NUM_ACTION_TYPES = 3
+ACTION_PICK_TURRET = 1     # mine the turret in a slot back into the agent inventory
+ACTION_PLACE_TURRET = 2    # place an inventory turret into an empty slot
+ACTION_REFILL_TURRET = 3   # insert ammo into the turret standing in a slot
+ACTION_MOVE_ANCHOR = 4     # teleport the character onto a chosen anchor tile
+NUM_ACTION_TYPES = 5
 
 # --- Observation grid ---
 NUM_CHANNELS = 8  # empty, wall, turret, ammo_pct, biter, spitter, spawner, character
@@ -36,6 +38,14 @@ MAX_SLOTS = 64
 
 # Per-slot feature width: [x, y, occupied, ammo, health]
 SLOT_FEATURES = 5
+
+# Max anchor tiles read from the map (padding target for the anchor arrays).
+# The character may only ever stand on one of these positions.
+MAX_ANCHORS = 32
+
+# Character interaction range in tiles. Slots within this distance of the
+# character's current anchor are valid PLACE/PICK/REFILL targets.
+REACH_DISTANCE = 10.0
 
 
 def make_observation_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.Dict:
@@ -68,6 +78,21 @@ def make_observation_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.Dict:
             "place_slot_mask": spaces.MultiBinary(MAX_SLOTS),
             # Real slots that currently hold a turret (valid REFILL_TURRET targets).
             "refill_slot_mask": spaces.MultiBinary(MAX_SLOTS),
+            # Real slots that currently hold a turret (valid PICK_TURRET targets).
+            "pick_slot_mask": spaces.MultiBinary(MAX_SLOTS),
+            # One row per anchor tile read from the map. (x, y) is the tile
+            # center; padding rows beyond the real anchor count are zero.
+            "anchors": spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(MAX_ANCHORS, 2),  # x, y
+                dtype=np.float32,
+            ),
+            # Real (non-padding) anchors. Doubles as the MOVE_TO_ANCHOR mask.
+            "anchor_valid_mask": spaces.MultiBinary(MAX_ANCHORS),
+            # Which turret slots are within REACH_DISTANCE of the character's
+            # current anchor. The PPO policy uses this to filter valid slot actions.
+            "reach_slot_mask": spaces.MultiBinary(MAX_SLOTS),
             "character": spaces.Box(
                 low=-np.inf,
                 high=np.inf,
@@ -101,19 +126,20 @@ def make_action_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.Dict:
             "action_type": spaces.Discrete(NUM_ACTION_TYPES),
             "slot_index": spaces.Discrete(MAX_SLOTS),
             "ammo_amount": spaces.Discrete(51),  # 0-50
+            "anchor_index": spaces.Discrete(MAX_ANCHORS),
         }
     )
 
 
 def flatten_action_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.MultiDiscrete:
     """Alternative flat action space for algorithms that don't support Dict."""
-    return spaces.MultiDiscrete([NUM_ACTION_TYPES, MAX_SLOTS, 51])
+    return spaces.MultiDiscrete([NUM_ACTION_TYPES, MAX_SLOTS, 51, MAX_ANCHORS])
 
 
 class FlatTDActionWrapper(gymnasium.Wrapper):
     """Wraps TowerDefenseEnv to expose a flat MultiDiscrete action space.
 
-    Order: [action_type, slot_index, ammo_amount]
+    Order: [action_type, slot_index, ammo_amount, anchor_index]
     Compatible with SB3 PPO / any algorithm that needs a non-Dict action space.
     """
 
@@ -127,6 +153,7 @@ class FlatTDActionWrapper(gymnasium.Wrapper):
             "action_type": int(action[0]),
             "slot_index": int(action[1]),
             "ammo_amount": int(action[2]),
+            "anchor_index": int(action[3]),
         }
         return self.env.step(dict_action)
 

@@ -32,17 +32,18 @@ storage.actions.reset = function(inventories_json, reset_position, all_technolog
 		for i, character in pairs(storage.agent_characters) do
 			-- Only process valid characters
 			if character and character.valid then
-				storage.actions.regenerate_resources(i)
+				-- regenerate_resources calls force.reset() which destroys all
+				-- player-force buildings; only do this when we are explicitly
+				-- wiping the map (clear_entities=true).
+				if clear_entities then
+					storage.actions.regenerate_resources(i)
+					storage.actions.clear_entities(i)
+				end
 				storage.actions.clear_walking_queue(i)
 
 				if reset_position then
 					local y_offset = (tonumber(i) or 1) - 1
 					character.teleport{ x = 0, y = y_offset * 2 }
-				end
-
-				-- Clear entities around each agent and reset inventories
-				if clear_entities then
-					storage.actions.clear_entities(i)
 				end
 
 				local inv_table = get_inventory_for_index(inventories, i)

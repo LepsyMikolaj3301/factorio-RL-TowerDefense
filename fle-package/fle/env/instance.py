@@ -388,6 +388,62 @@ class FactorioInstance:
         print(f"Connected to {address} client at tcp/{tcp_port}.")
         return rcon_client, address
 
+    def reconnect_rcon(
+        self,
+        pause_after: bool = True,
+        wait: float = 3.0,
+        retries: int = 5,
+    ) -> None:
+        """Re-establish the RCON connection after a drop.
+
+        Factorio closes RCON connections briefly when a human client joins
+        (map sync stalls the networking layer). This patches all three handles
+        that hold a reference to the socket:
+          - self.rcon_client          (direct callers)
+          - self.lua_script_manager.rcon_client  (tool calls via namespace)
+          - self.game_control.rcon_client        (pause/unpause/speed)
+
+        If pause_after is True (the default) the game is paused immediately
+        after reconnecting to minimise the extra ticks that elapsed while the
+        connection was down. Callers that care about elapsed time should re-read
+        get_elapsed_ticks() after this call.
+
+        Raises RuntimeError if all retries are exhausted.
+        """
+        import logging
+        log = logging.getLogger(__name__)
+
+        for attempt in range(1, retries + 1):
+            time.sleep(wait)
+            try:
+                new_client = RCONClient(self.address, self.tcp_port, RCON_PASSWORD)
+                new_client.connect()
+                new_client.send_command("/sc rcon.print('reconnected')")
+
+                self.rcon_client = new_client
+                self.lua_script_manager.rcon_client = new_client
+                self.game_control.rcon_client = new_client
+
+                if pause_after:
+                    new_client.send_command("/sc game.tick_paused = true")
+                    self.game_control._is_paused = True
+
+                log.warning(
+                    "RCON reconnected to %s tcp/%s (attempt %d/%d)%s",
+                    self.address, self.tcp_port, attempt, retries,
+                    " — game paused" if pause_after else "",
+                )
+                return
+            except Exception as e:
+                log.warning(
+                    "RCON reconnect attempt %d/%d failed: %s", attempt, retries, e
+                )
+
+        raise RuntimeError(
+            f"Could not reconnect RCON to {self.address}:{self.tcp_port} "
+            f"after {retries} attempts."
+        )
+
     def initialise(
         self, fast=True, all_technologies_researched=True, clear_entities=True
     ):

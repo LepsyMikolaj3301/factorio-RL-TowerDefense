@@ -2,7 +2,6 @@ import argparse
 import os
 import sys
 import shutil
-import subprocess
 from pathlib import Path
 import importlib.resources
 
@@ -21,26 +20,44 @@ def fle_init():
 
 
 def fle_cluster(args):
-    cluster_path = Path(__file__).parent / "cluster"
-    script = cluster_path / "run-envs.sh"
-    if not script.exists():
-        print(f"Cluster script not found: {script}", file=sys.stderr)
-        sys.exit(1)
-    cmd = [str(script)]
-    if args:
-        if args.cluster_command:
-            cmd.append(args.cluster_command)
-        if args.n:
-            cmd.extend(["-n", str(args.n)])
-        if args.s:
-            cmd.extend(["-s", args.s])
-        if getattr(args, "save_path", None):
-            cmd.extend(["--save-path", args.save_path])
+    # Route through the Python ClusterManager (handles tower_defense config
+    # selection and save-file loading, which the legacy shell script does not).
+    from fle.cluster.run_envs import start_cluster, stop_cluster, restart_cluster
+
+    command = (args.cluster_command if args else None) or "start"
+
+    if command == "stop":
+        stop_cluster()
+        return
+    if command == "restart":
+        restart_cluster()
+        return
+    if command == "help":
+        print(
+            "Usage: fle cluster [start|stop|restart] [-n N] [-s SCENARIO] "
+            "[--save-path FILE] [--generate]\n"
+            "  tower_defense loads data/saves/tower_defense.zip by default; "
+            "pass --generate to build a fresh map."
+        )
+        return
+
+    # start
+    num_instances = args.n or 1
+    scenario = args.s or "tower_defense"
+    save_path = getattr(args, "save_path", None)
+    generate = getattr(args, "generate", False)
     try:
-        subprocess.run(cmd, cwd=str(cluster_path), check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Error running cluster script: {e}", file=sys.stderr)
-        sys.exit(e.returncode)
+        start_cluster(
+            num_instances=num_instances,
+            scenario=scenario,
+            save_file=save_path,
+            generate=generate,
+        )
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"Error starting cluster: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def main():
@@ -70,12 +87,20 @@ Examples:
     parser_cluster.add_argument(
         "-s",
         type=str,
-        help="Scenario (open_world, default_lab_scenario, or tower_defense)",
+        help="Scenario (open_world, default_lab_scenario, or tower_defense). "
+        "Defaults to tower_defense.",
     )
     parser_cluster.add_argument(
         "--save-path",
         type=str,
-        help="Path to a Factorio save file (.zip) to use instead of a scenario",
+        help="Path to a Factorio save file (.zip) to load. For tower_defense, "
+        "defaults to data/saves/tower_defense.zip.",
+    )
+    parser_cluster.add_argument(
+        "--generate",
+        action="store_true",
+        help="Generate a fresh map from the scenario instead of loading a save. "
+        "Not supported for tower_defense, which always requires a predefined save.",
     )
 
     # Init subcommand

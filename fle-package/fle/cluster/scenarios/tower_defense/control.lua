@@ -1,5 +1,11 @@
 -- Tower Defense scenario control.lua
 -- Non-peaceful mode with enemy spawning support
+--
+-- Map authoring notes:
+--   * The env READS the existing radar at (0,0) — it never places one.
+--   * Enemy spawners (unit-spawner, enemy force) should be baked into the save
+--     outside the wall ring; they persist across all resets for free.
+--   * on_init runs only when a brand-new map is created, NOT when loading a save.
 util = require("util")
 
 script.on_init(function()

@@ -45,6 +45,31 @@ class TDScenarioConfig:
     # slots are read purely from the map's existing turrets.
     turret_slot_positions: Optional[List[Tuple[float, float]]] = None
 
+    # --- Anchor tiles ---
+    # The character may only stand on "anchor" positions, which the map author
+    # paints with the `hazard-concrete-left` tile texture. The env scans for
+    # these tiles once on first reset and lets the policy move between them.
+    # Upper bound on anchors tracked (must match td_spaces.MAX_ANCHORS).
+    max_anchor_slots: int = 32
+    # Half-width (tiles) of the square area scanned around the radar center for
+    # anchor tiles. Matches the chart radius used by _read_radar.
+    anchor_scan_radius: float = 128.0
+
+    # --- Spawn & reset behaviour ---
+    # Where the agent character is placed after each reset. The radar occupies
+    # (0,0) by convention; (0,10) keeps the agent inside the walled ring but
+    # off the radar tile.
+    player_spawn_position: Tuple[float, float] = (0.0, 10.0)
+    # When False, _spawn_wave() is a no-op — biters must originate from the
+    # map's own Factorio AI (useful for debugging or map-only configs).
+    spawn_waves_at_runtime: bool = True
+    # When True, waves are sent from the map's baked-in unit-spawners (enemy
+    # force). Falls back to the geometric-ring origin if no spawners exist.
+    spawn_from_map_spawners: bool = True
+    # Destroy stale enemy *units* at the start of each episode so the agent
+    # always begins with a clean board. Spawner entities are never touched.
+    clear_biters_on_reset: bool = True
+
     # --- Reward weights ---
     alpha_survive: float = 0.01      # per step
     beta_kills: float = 1.0          # per kill
@@ -54,11 +79,10 @@ class TDScenarioConfig:
     terminal_penalty: float = -100.0
 
     # --- Starting inventory ---
+    # Only ammo is given at the start. Turrets come from the map: N are
+    # removed and placed in the agent's inventory by _delete_turret_subset().
     starting_inventory: Dict[str, int] = field(default_factory=lambda: {
-        "firearm-magazine": 200,
-        "piercing-rounds-magazine": 50,
-        "gun-turret": 10,
-        "stone-wall": 50,
+        "piercing-rounds-magazine": 500,
     })
 
     # Named presets (assigned after class definition below)
@@ -73,10 +97,7 @@ TDScenarioConfig.EASY = TDScenarioConfig(
     ticks_per_wave=5400,   # 90 s between waves
     turret_deletion_percentage=0.3,  # most turrets stay; light replanning
     starting_inventory={
-        "firearm-magazine": 400,
-        "piercing-rounds-magazine": 100,
-        "gun-turret": 20,
-        "stone-wall": 100,
+        "piercing-rounds-magazine": 1000,
     },
 )
 
@@ -88,9 +109,6 @@ TDScenarioConfig.HARD = TDScenarioConfig(
     ticks_per_wave=2400,   # 40 s between waves
     turret_deletion_percentage=0.7,  # many empty slots, scarce turrets to fill them
     starting_inventory={
-        "firearm-magazine": 100,
-        "piercing-rounds-magazine": 20,
-        "gun-turret": 5,
-        "stone-wall": 20,
+        "piercing-rounds-magazine": 200,
     },
 )

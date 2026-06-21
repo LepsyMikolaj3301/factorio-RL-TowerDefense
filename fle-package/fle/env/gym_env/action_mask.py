@@ -5,9 +5,11 @@ import gymnasium
 from gymnasium import spaces
 
 from fle.env.gym_env.td_spaces import (
+    ACTION_MOVE_ANCHOR,
     ACTION_NOOP,
     ACTION_PLACE_TURRET,
     ACTION_REFILL_TURRET,
+    MAX_ANCHORS,
     MAX_SLOTS,
     NUM_ACTION_TYPES,
     TRACKED_ITEMS,
@@ -42,6 +44,7 @@ class ActionMaskWrapper(gymnasium.Wrapper):
                 **env.observation_space.spaces,
                 "action_type_mask": spaces.MultiBinary(NUM_ACTION_TYPES),
                 "slot_mask": spaces.MultiBinary(MAX_SLOTS),
+                "anchor_mask": spaces.MultiBinary(MAX_ANCHORS),
             }
         )
 
@@ -66,15 +69,25 @@ class ActionMaskWrapper(gymnasium.Wrapper):
         if has_ammo and np.any(refill_slots):
             mask[ACTION_REFILL_TURRET] = 1
 
+        # Can move only if the map has at least one anchor to move to.
+        anchors = obs.get("anchor_valid_mask", np.zeros(MAX_ANCHORS))
+        if np.any(anchors):
+            mask[ACTION_MOVE_ANCHOR] = 1
+
         return mask
 
     def _slot_mask(self, obs: dict) -> np.ndarray:
         valid = obs.get("slot_valid_mask", np.zeros(MAX_SLOTS, dtype=np.int8))
         return np.asarray(valid, dtype=np.int8)
 
+    def _anchor_mask(self, obs: dict) -> np.ndarray:
+        valid = obs.get("anchor_valid_mask", np.zeros(MAX_ANCHORS, dtype=np.int8))
+        return np.asarray(valid, dtype=np.int8)
+
     def _augment(self, obs: dict) -> dict:
         obs["action_type_mask"] = self._compute_action_type_mask(obs)
         obs["slot_mask"] = self._slot_mask(obs)
+        obs["anchor_mask"] = self._anchor_mask(obs)
         return obs
 
     def reset(self, **kwargs):
