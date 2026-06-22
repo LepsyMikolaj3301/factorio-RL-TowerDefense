@@ -69,14 +69,42 @@ class TDScenarioConfig:
     # Destroy stale enemy *units* at the start of each episode so the agent
     # always begins with a clean board. Spawner entities are never touched.
     clear_biters_on_reset: bool = True
+    # Rebuild the enemy nest layout (unit-spawners + worm turrets) to the map's
+    # original starting set on every reset, removing nests created by expansion
+    # during the previous episode. Recorded once on first reset.
+    restore_starting_nests_on_reset: bool = True
+
+    # --- Threat tracking ---
+    # A live enemy cluster of >= this many units is flagged is_swarm in the obs.
+    swarm_threshold: int = 60
+    # Radius (tiles) scanned for biter groups (larger than the obs grid so the
+    # agent sees a swarm forming on the approach). Nests are searched surface-wide.
+    threat_scan_radius: float = 96.0
+    # Coarse cell size (tiles) used to bucket enemies before clustering.
+    threat_cell_size: float = 6.0
+
+    # --- Movement ---
+    # Tiles the async on_tick walker advances the character per game tick.
+    walk_speed: float = 0.2
 
     # --- Reward weights ---
-    alpha_survive: float = 0.01      # per step
-    beta_kills: float = 1.0          # per kill
-    delta_damage: float = 0.5        # per HP of damage taken
+    alpha_survive: float = 0.01      # per step survived
+    beta_kills: float = 1.0          # per enemy killed
+    delta_damage: float = 0.5        # per HP of character damage taken
     epsilon_invalid: float = 0.5     # per invalid action
-    terminal_bonus: float = 100.0
-    terminal_penalty: float = -100.0
+    # Destruction penalties (per entity lost to the enemy this step).
+    p_wall_destroyed: float = 5.0          # strong
+    p_turret_destroyed: float = 20.0       # very strong (turret permanently lost)
+    p_building_destroyed: float = 20.0     # very strong
+    p_radar_damage: float = 0.2            # per HP the radar (the "heart") loses
+    terminal_bonus: float = 100.0          # survived to max_ticks
+    terminal_penalty: float = -200.0       # radar destroyed or character died (very strong)
+
+    # --- Dense shaping (annealed to 0 over shaping_decay_steps env steps) ---
+    w_coverage: float = 0.05   # reward for fraction of reachable slots filled
+    w_ammo: float = 0.02       # reward for fraction of live turrets carrying ammo
+    w_threat: float = 0.05     # penalty scaling with closeness of the nearest swarm
+    shaping_decay_steps: int = 200_000
 
     # --- Starting inventory ---
     # Only ammo is given at the start. Turrets come from the map: N are

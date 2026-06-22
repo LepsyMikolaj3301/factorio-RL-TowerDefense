@@ -262,8 +262,10 @@ def test_episode_restart_restores_initial_state(td_save_instance):
         err_msg=f"Inventory changed between resets: {obs1['inventory']} → {obs2['inventory']}",
     )
 
-    # Character position should be at spawn (0, 10) both times
-    char_x2, char_y2 = float(obs2["character"][0]), float(obs2["character"][1])
+    # Character position should be at spawn (0, 10) both times. The obs stores
+    # radar-relative *normalized* coords, so de-normalize back to world coords.
+    char_x2 = float(obs2["character"][0]) * env._norm + env._center_x
+    char_y2 = float(obs2["character"][1]) * env._norm + env._center_y
     spawn_x, spawn_y = cfg.player_spawn_position
     assert abs(char_x2 - spawn_x) < 2.0 and abs(char_y2 - spawn_y) < 2.0, (
         f"Character not at spawn after second reset: ({char_x2:.1f},{char_y2:.1f})"

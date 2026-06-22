@@ -47,6 +47,38 @@ MAX_ANCHORS = 32
 # character's current anchor are valid PLACE/PICK/REFILL targets.
 REACH_DISTANCE = 10.0
 
+# --- Threat tracking (biter groups + nests) ---
+# Max biter *groups* (swarms / clusters) tracked. Each is a cluster of live
+# enemy units, distinct from a nest (spawner). Padding target for the array.
+MAX_GROUPS = 12
+# Per-group feature width:
+#   [rel_cx, rel_cy, count_norm, spread_norm, head_dx, head_dy,
+#    dist_radar_norm, dist_turret_norm, eta_norm, is_swarm]
+GROUP_FEATURES = 10
+
+# Max biter nests (unit-spawners) tracked. Padding target for the array.
+MAX_NESTS = 8
+# Per-nest feature width: [rel_cx, rel_cy, health_norm, dist_radar_norm, dir_dx, dir_dy]
+NEST_FEATURES = 6
+
+# A cluster of at least this many live enemies is flagged as a "swarm"
+# (is_swarm=1). The big groups (~60) you described read very differently from
+# a nest at the symbolic level because of this flag + the count feature.
+SWARM_THRESHOLD = 60
+
+# --- Movement / transit state ---
+# [is_moving, target_anchor_norm, remaining_dist_norm, head_dx, head_dy]
+MOVEMENT_FEATURES = 5
+
+# --- Normalization constants (used by the env to condition obs for the NN) ---
+COUNT_NORM = 100.0       # divide enemy counts by this
+ETA_NORM = 600.0         # ticks-to-base normalizer (~10s at 60tps)
+NEST_HP_NORM = 350.0     # spawner max HP ballpark
+CHAR_HP_NORM = 250.0     # character max HP ballpark
+RADAR_HP_NORM = 250.0    # radar max HP ballpark
+TURRET_HP_NORM = 400.0   # gun-turret max HP ballpark
+TURRET_AMMO_NORM = 10.0  # gun-turret ammo slot capacity ballpark
+
 
 def make_observation_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.Dict:
     """Create the tower defense observation space."""
@@ -80,6 +112,12 @@ def make_observation_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.Dict:
             "refill_slot_mask": spaces.MultiBinary(MAX_SLOTS),
             # Real slots that currently hold a turret (valid PICK_TURRET targets).
             "pick_slot_mask": spaces.MultiBinary(MAX_SLOTS),
+            # Action-conditioned reach masks: the per-action slot mask AND'd with
+            # reach_slot_mask. The pointer head consumes these directly so it can
+            # never select an out-of-reach slot for the chosen action type.
+            "place_reach_mask": spaces.MultiBinary(MAX_SLOTS),
+            "refill_reach_mask": spaces.MultiBinary(MAX_SLOTS),
+            "pick_reach_mask": spaces.MultiBinary(MAX_SLOTS),
             # One row per anchor tile read from the map. (x, y) is the tile
             # center; padding rows beyond the real anchor count are zero.
             "anchors": spaces.Box(
@@ -93,6 +131,30 @@ def make_observation_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.Dict:
             # Which turret slots are within REACH_DISTANCE of the character's
             # current anchor. The PPO policy uses this to filter valid slot actions.
             "reach_slot_mask": spaces.MultiBinary(MAX_SLOTS),
+            # Biter groups (swarms): clusters of live enemies, distinct from nests.
+            # All positions are relative to the radar center and normalized.
+            "biter_groups": spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(MAX_GROUPS, GROUP_FEATURES),
+                dtype=np.float32,
+            ),
+            "group_valid_mask": spaces.MultiBinary(MAX_GROUPS),
+            # Biter nests (unit-spawners): the origins, even when at the grid edge.
+            "nests": spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(MAX_NESTS, NEST_FEATURES),
+                dtype=np.float32,
+            ),
+            "nest_valid_mask": spaces.MultiBinary(MAX_NESTS),
+            # Transit state for the async A* walk (see TowerDefenseEnv._move_to_anchor).
+            "movement": spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(MOVEMENT_FEATURES,),
+                dtype=np.float32,
+            ),
             "character": spaces.Box(
                 low=-np.inf,
                 high=np.inf,

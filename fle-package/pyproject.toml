@@ -44,6 +44,8 @@ dependencies = [
     "matplotlib>=3.10.7",
     "platformdirs>=4.0.0",
     "pyyaml>=6.0.0",
+    "stable-baselines3>=2.9.0",
+    "sb3-contrib>=2.9.0",
 ]
 
 [project.optional-dependencies]

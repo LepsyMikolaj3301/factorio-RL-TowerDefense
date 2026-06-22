@@ -18,12 +18,24 @@ from fle.env.gym_env.td_spaces import (
     ACTION_PICK_TURRET,
     ACTION_PLACE_TURRET,
     ACTION_REFILL_TURRET,
+    CHAR_HP_NORM,
+    COUNT_NORM,
+    ETA_NORM,
+    GROUP_FEATURES,
     MAX_ANCHORS,
+    MAX_GROUPS,
+    MAX_NESTS,
     MAX_SLOTS,
+    MOVEMENT_FEATURES,
+    NEST_FEATURES,
+    NEST_HP_NORM,
     NUM_CHANNELS,
+    RADAR_HP_NORM,
     REACH_DISTANCE,
     SLOT_FEATURES,
     TRACKED_ITEMS,
+    TURRET_AMMO_NORM,
+    TURRET_HP_NORM,
     make_action_space,
     make_observation_space,
 )
@@ -86,12 +98,29 @@ class TowerDefenseEnv(gymnasium.Env):
 
         # Internal state
         self._step_count = 0
+        self._total_steps = 0  # lifetime steps (for shaping decay)
         self._prev_kills = 0
         self._prev_health = 0.0
+        self._prev_radar_hp = 0.0
         self._wave_number = 0
         self._center_x = 0.0
         self._center_y = 0.0
         self._radius = self.grid_size * self.cell_size / 2.0
+        # Position normalizer (radar-relative coords are divided by this).
+        self._norm = max(1.0, self._radius)
+
+        # Async-movement state (set by _move_to_anchor, polled in step()).
+        self._moving = False
+        self._move_target = -1
+
+        # Raw (un-normalized) values stashed during _get_observation so the
+        # reward/termination logic doesn't re-query the game.
+        self._cur_char_hp = 0.0
+        self._cur_radar_hp = 0.0
+        self._cur_coverage = 0.0       # filled_reachable / total_reachable
+        self._cur_ammo_frac = 0.0      # loaded_turrets / live_turrets
+        self._cur_threat_closeness = 0.0  # 0 (far) .. 1 (on top of base)
+        self._last_events: Dict[str, int] = {}
 
         # Canonical turret slots, read once from the map on first reset.
         # Shape (N, 2): the (x, y) center of every slot. Never changes for a run.
@@ -119,6 +148,10 @@ class TowerDefenseEnv(gymnasium.Env):
         self._has_radar: bool = False
         self._radar_position: Optional[Position] = None
 
+        # Starting enemy nest/worm layout, recorded once on first reset as a
+        # list of (name, x, y). Used to rebuild nests on every reset.
+        self._starting_nests: Optional[list] = None
+
     def reset(
         self,
         *,
@@ -135,6 +168,8 @@ class TowerDefenseEnv(gymnasium.Env):
             self.instance._reset_elapsed_ticks()
 
             self._read_radar()
+            # Record the pristine nest layout before any episode mutates it.
+            self._record_starting_nests()
             self._spawn_player()
             self._clear_resource_entities()
             if self.config.clear_biters_on_reset:
@@ -171,6 +206,8 @@ class TowerDefenseEnv(gymnasium.Env):
             self._spawn_player()
             if self.config.clear_biters_on_reset:
                 self._clear_live_biters()
+            if self.config.restore_starting_nests_on_reset:
+                self._restore_starting_nests()
 
         # Re-roll which slots start empty for this episode (seeded by reset seed).
         self._delete_turret_subset()
@@ -178,8 +215,14 @@ class TowerDefenseEnv(gymnasium.Env):
         self._step_count = 0
         self._prev_kills = 0
         self._prev_health = self._get_character_health()
+        self._prev_radar_hp = self._get_radar_hp()
         self._wave_number = 0
         self._current_anchor_index = 0
+        self._moving = False
+        self._move_target = -1
+        # Flush any death events accumulated outside an episode so the first
+        # step's reward only reflects in-episode deaths.
+        self._read_events()
 
         obs = self._get_observation()
         info = {"step": 0, "elapsed_ticks": 0, "wave": 0}
@@ -257,6 +300,47 @@ class TowerDefenseEnv(gymnasium.Env):
             "/sc for _,e in pairs(game.surfaces[1].find_entities_filtered("
             "{type='unit', force='enemy'})) do e.destroy() end"
         )
+
+    def _record_starting_nests(self) -> None:
+        """Record the map's pristine nest/worm layout (called once, first reset).
+
+        Captures every enemy-force unit-spawner and worm turret as (name, x, y)
+        so the layout can be rebuilt exactly on every subsequent reset.
+        """
+        raw = self.instance.rcon_client.send_command(
+            "/sc local o={} "
+            "for _,e in pairs(game.surfaces[1].find_entities_filtered{force='enemy'}) do "
+            "if e.type=='unit-spawner' or e.type=='turret' then "
+            "o[#o+1]=e.name..','..e.position.x..','..e.position.y end end "
+            "rcon.print(table.concat(o,';'))"
+        ).strip()
+        self._starting_nests = []
+        if raw and raw != "nil":
+            for part in raw.split(";"):
+                if not part:
+                    continue
+                name, x, y = part.rsplit(",", 2)
+                self._starting_nests.append((name, float(x), float(y)))
+
+    def _restore_starting_nests(self) -> None:
+        """Rebuild the enemy nest layout to the recorded starting set.
+
+        Destroys every current enemy nest/worm (including those created by
+        expansion during the previous episode), then recreates the original
+        starting nests. Self-healing: also restores starting nests the agent
+        destroyed last episode.
+        """
+        if not self._starting_nests:
+            return
+        self.instance.rcon_client.send_command(
+            "/sc for _,e in pairs(game.surfaces[1].find_entities_filtered{force='enemy'}) do "
+            "if e.type=='unit-spawner' or e.type=='turret' then e.destroy() end end"
+        )
+        parts = "".join(
+            f"s.create_entity{{name='{n}',position={{{x},{y}}},force='enemy'}} "
+            for (n, x, y) in self._starting_nests
+        )
+        self.instance.rcon_client.send_command(f"/sc local s=game.surfaces[1] {parts}")
 
     def _clear_resource_entities(self) -> None:
         """Remove ore deposits from the map — not needed in tower defense."""
@@ -466,6 +550,7 @@ class TowerDefenseEnv(gymnasium.Env):
         self, action: Dict[str, Any]
     ) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
         self._step_count += 1
+        self._total_steps += 1
 
         # Execute action
         invalid = self._execute_action(action)
@@ -493,6 +578,17 @@ class TowerDefenseEnv(gymnasium.Env):
 
         elapsed_ticks = self.instance.get_elapsed_ticks()
 
+        # Poll the async walker: it advanced the character during the unpaused
+        # window. Update transit state; snap the current anchor on arrival so the
+        # reach mask re-enables turret actions for the reached anchor.
+        moving, target = self._read_walk_state()
+        self._moving = moving
+        if moving:
+            self._move_target = target
+        elif self._move_target >= 0:
+            self._current_anchor_index = self._move_target
+            self._move_target = -1
+
         # --- Runtime wave triggering (DISABLED) ---------------------------------
         # The map already ships with baked-in biter nests that spawn and path to
         # the base on their own, so we don't drive waves from Python for now.
@@ -519,11 +615,18 @@ class TowerDefenseEnv(gymnasium.Env):
         elif truncated:
             reward += self.config.terminal_bonus
 
+        ev = getattr(self, "_last_events", {}) or {}
         info = {
             "step": self._step_count,
             "elapsed_ticks": elapsed_ticks,
             "wave": self._wave_number,
             "invalid_action": invalid,
+            "is_moving": self._moving,
+            "kills": ev.get("kills", 0),
+            "turrets_lost": ev.get("turrets_lost", 0),
+            "walls_lost": ev.get("walls_lost", 0),
+            "buildings_lost": ev.get("buildings_lost", 0),
+            "coverage": self._cur_coverage,
         }
 
         return obs, reward, terminated, truncated, info
@@ -539,9 +642,15 @@ class TowerDefenseEnv(gymnasium.Env):
             return False
 
         # Movement is anchor-indexed (not slot-indexed); handle it before the
-        # turret-slot resolution below.
+        # turret-slot resolution below. Re-routing mid-transit is always allowed.
         if action_type == ACTION_MOVE_ANCHOR:
             return self._move_to_anchor(anchor_index)
+
+        # While walking, the only legal actions are re-route (MOVE_ANCHOR) or
+        # NOOP — you cannot service a turret while in transit. Enforce it here so
+        # the rule holds even without the action-mask wrapper.
+        if self._moving:
+            return True
 
         # Resolve the slot index to a real slot center.
         n = 0 if self._turret_slots is None else len(self._turret_slots)
@@ -607,51 +716,153 @@ class TowerDefenseEnv(gymnasium.Env):
         return None
 
     def _move_to_anchor(self, anchor_index: int) -> bool:
-        """Teleport the character onto the chosen anchor tile. Returns True if invalid."""
+        """Start an asynchronous walk to the chosen anchor tile.
+
+        Hands a path to the scenario's on_tick walker (via the walk_to tool); the
+        character then travels over the next decision window(s) while biters keep
+        attacking. Does NOT block. Returns True if the anchor index is invalid.
+        Issuing this while already walking simply re-routes to the new anchor.
+        """
         n = 0 if self._anchor_slots is None else len(self._anchor_slots)
         if anchor_index < 0 or anchor_index >= n:
             return True  # padding / out-of-range anchor
         ax = float(self._anchor_slots[anchor_index][0])
         ay = float(self._anchor_slots[anchor_index][1])
         try:
-            self.instance.rcon_client.send_command(
-                f"/sc storage.agent_characters[1].teleport({{{ax},{ay}}})"
+            cx, cy = self._get_char_pos()
+            waypoints = self._plan_path(Position(x=cx, y=cy), Position(x=ax, y=ay))
+            self.instance.first_namespace.walk_to(
+                waypoints, anchor_index, speed=self.config.walk_speed
             )
-            self.instance.first_namespace.player_location = Position(x=ax, y=ay)
-            self._current_anchor_index = anchor_index
+            self._moving = True
+            self._move_target = anchor_index
             return False
         except Exception as e:
             logger.debug(f"Move-to-anchor failed: {e}")
             return True
 
-    def _spawn_wave(self):
-        """Spawn a wave of enemies using biter_director."""
-        if not self.config.spawn_waves_at_runtime:
-            return
+    def _plan_path(self, start: Position, finish: Position) -> list:
+        """Return an ordered waypoint list from start to finish.
+
+        Tries Factorio A* (request_path/get_path) for obstacle-aware routing and
+        falls back to a straight line. The teleport-based walker tolerates either,
+        so the straight line is a safe fallback (e.g. when the pathfinder is busy
+        or the game is paused). Swapping in richer routing later is transparent.
+        """
+        ns = self.instance.first_namespace
         try:
-            self.instance.first_namespace._biter_director(
-                wave_number=self._wave_number,
-                center_x=self._center_x,
-                center_y=self._center_y,
-                spawn_radius=self._radius * 1.5,
-                base_count=self.config.base_enemy_count,
-                escalation_factor=self.config.escalation_factor,
-                use_spawners=self.config.spawn_from_map_spawners,
-                target_x=self._center_x,
-                target_y=self._center_y,
+            handle = ns._request_path(
+                start, finish, allow_paths_through_own_entities=True, resolution=-1
             )
+            waypoints = ns._get_path(handle)
+            if waypoints:
+                return waypoints
         except Exception as e:
-            logger.warning(f"Failed to spawn wave {self._wave_number}: {e}")
+            logger.debug(f"A* path failed ({e}); using straight-line walk")
+        return [finish]
+
+    def _get_char_pos(self) -> Tuple[float, float]:
+        """Read the agent character's live (x, y) from the game."""
+        try:
+            raw = self.instance.rcon_client.send_command(
+                "/sc local c=storage.agent_characters and storage.agent_characters[1]; "
+                "if c and c.valid then rcon.print(c.position.x..','..c.position.y) "
+                "else rcon.print('nil') end"
+            ).strip()
+            if raw and raw != "nil":
+                x, y = raw.split(",")
+                return float(x), float(y)
+        except Exception:
+            pass
+        return self._center_x, self._center_y
+
+    def _read_walk_state(self) -> Tuple[bool, int]:
+        """Return (is_moving, target_anchor) from the scenario walk controller."""
+        try:
+            raw = self.instance.rcon_client.send_command(
+                "/sc local w=storage.td_walk; "
+                "if w and w.active then rcon.print(tostring(w.target_anchor)) "
+                "else rcon.print('done') end"
+            ).strip()
+            if raw == "done" or not raw:
+                return False, self._move_target
+            return True, int(float(raw))
+        except Exception:
+            return False, self._move_target
+
+    def _read_events(self) -> Dict[str, int]:
+        """Read & clear the server-side death/kill counters for this window."""
+        try:
+            return self.instance.first_namespace._read_td_events()
+        except Exception:
+            return {
+                "kills": 0, "turrets_lost": 0, "walls_lost": 0,
+                "buildings_lost": 0, "radar_lost": 0, "char_died": 0,
+            }
+
+    def _get_radar_hp(self) -> float:
+        """Read the radar's current HP directly (0 if no radar / destroyed)."""
+        if not self._has_radar:
+            return 0.0
+        try:
+            raw = self.instance.rcon_client.send_command(
+                "/sc local e=game.surfaces[1].find_entities_filtered{name='radar'}[1]; "
+                "rcon.print(e and e.valid and e.health or 0)"
+            ).strip()
+            return float(raw)
+        except Exception:
+            return 0.0
+
+    # --- Runtime wave spawning (DISABLED) -----------------------------------
+    # The map ships with baked-in biter nests that spawn and path to the base on
+    # their own, so we never drive waves from Python. The only call site (in
+    # step()) is already commented out; the method body is kept here, commented,
+    # for later development. Re-enable both together if runtime waves are wanted.
+    #
+    # def _spawn_wave(self):
+    #     """Spawn a wave of enemies using biter_director."""
+    #     if not self.config.spawn_waves_at_runtime:
+    #         return
+    #     try:
+    #         self.instance.first_namespace._biter_director(
+    #             wave_number=self._wave_number,
+    #             center_x=self._center_x,
+    #             center_y=self._center_y,
+    #             spawn_radius=self._radius * 1.5,
+    #             base_count=self.config.base_enemy_count,
+    #             escalation_factor=self.config.escalation_factor,
+    #             use_spawners=self.config.spawn_from_map_spawners,
+    #             target_x=self._center_x,
+    #             target_y=self._center_y,
+    #         )
+    #     except Exception as e:
+    #         logger.warning(f"Failed to spawn wave {self._wave_number}: {e}")
+    # ------------------------------------------------------------------------
 
     def _get_observation(self) -> Dict[str, np.ndarray]:
-        """Build the observation dict from game state."""
+        """Build the observation dict from game state.
+
+        All positions are emitted relative to the radar center and normalized by
+        the grid radius (self._norm) so the network sees well-conditioned inputs.
+        Raw values needed by the reward are stashed on self._cur_* to avoid extra
+        RCON round-trips in _compute_reward.
+        """
         ns = self.instance.first_namespace
+        cx0, cy0 = self._center_x, self._center_y
+        norm = self._norm
+
+        # Live character position (the async walker may have moved it).
+        chx, chy = self._get_char_pos()
+        try:
+            ns.player_location = Position(x=chx, y=chy)
+        except Exception:
+            pass
 
         # Map grid from radar_view
         try:
             map_grid = ns._radar_view(
-                center_x=self._center_x,
-                center_y=self._center_y,
+                center_x=cx0,
+                center_y=cy0,
                 radius=int(self._radius),
                 cell_size=self.cell_size,
                 charted_only=True,
@@ -674,11 +885,11 @@ class TowerDefenseEnv(gymnasium.Env):
         except Exception:
             inv_arr = np.zeros(len(TRACKED_ITEMS), dtype=np.int32)
 
-        # Entities (used for turret occupancy and the radar lookup)
+        # Entities (used for turret occupancy)
         entities = []
         try:
             entities = ns.get_entities(
-                position=Position(x=self._center_x, y=self._center_y),
+                position=Position(x=cx0, y=cy0),
                 radius=self._radius,
             )
         except Exception:
@@ -694,68 +905,109 @@ class TowerDefenseEnv(gymnasium.Env):
             if getattr(e, "name", None) == "gun-turret"
         ]
 
-        # Turret slots + masks
+        # Turret slots + masks (positions normalized; reach from LIVE char pos)
         slots_arr = np.zeros((MAX_SLOTS, SLOT_FEATURES), dtype=np.float32)
         slot_valid_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
         place_slot_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
         refill_slot_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
         pick_slot_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
-        # Mark padding rows as occupied = -1
-        slots_arr[:, 2] = -1.0
+        reach_slot_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
+        slots_arr[:, 2] = -1.0  # padding rows: occupied = -1
+        live_turrets = 0
+        loaded_turrets = 0
         n = 0 if self._turret_slots is None else len(self._turret_slots)
         if n > 0:
             occupied, feats = self._slot_occupancy(turrets)
             for i in range(min(n, MAX_SLOTS)):
                 sx, sy = self._turret_slots[i]
-                slots_arr[i] = [sx, sy, feats[i][0], feats[i][1], feats[i][2]]
+                occ, ammo, hp = feats[i][0], feats[i][1], feats[i][2]
+                slots_arr[i] = [
+                    (sx - cx0) / norm, (sy - cy0) / norm,
+                    occ, ammo / TURRET_AMMO_NORM, hp / TURRET_HP_NORM,
+                ]
                 slot_valid_mask[i] = 1
+                if math.hypot(sx - chx, sy - chy) <= REACH_DISTANCE:
+                    reach_slot_mask[i] = 1
                 if occupied[i]:
                     refill_slot_mask[i] = 1
                     pick_slot_mask[i] = 1
+                    live_turrets += 1
+                    if ammo > 0:
+                        loaded_turrets += 1
                 else:
                     place_slot_mask[i] = 1
 
-        # Anchors (static positions the character may stand on)
+        # Action-conditioned reach masks. While in transit no turret action is
+        # legal, so they are all zero (the policy may only re-route / noop).
+        if self._moving:
+            place_reach_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
+            refill_reach_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
+            pick_reach_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
+        else:
+            place_reach_mask = (place_slot_mask & reach_slot_mask).astype(np.int8)
+            refill_reach_mask = (refill_slot_mask & reach_slot_mask).astype(np.int8)
+            pick_reach_mask = (pick_slot_mask & reach_slot_mask).astype(np.int8)
+
+        # Anchors (normalized)
         anchors_arr = np.zeros((MAX_ANCHORS, 2), dtype=np.float32)
         anchor_valid_mask = np.zeros(MAX_ANCHORS, dtype=np.int8)
         na = 0 if self._anchor_slots is None else len(self._anchor_slots)
         for i in range(min(na, MAX_ANCHORS)):
-            anchors_arr[i] = self._anchor_slots[i]
+            ax, ay = self._anchor_slots[i]
+            anchors_arr[i] = [(ax - cx0) / norm, (ay - cy0) / norm]
             anchor_valid_mask[i] = 1
 
-        # Reach mask: which slots are within REACH_DISTANCE of the current anchor
-        reach_slot_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
-        if self._anchor_reach_matrix is not None:
-            reach_slot_mask[:] = self._anchor_reach_matrix[self._current_anchor_index]
+        # Character (normalized)
+        char_hp = self._get_character_health()
+        ammo_total = float(inv_arr[0] + inv_arr[1]) if len(inv_arr) >= 2 else 0.0
+        char_arr = np.array(
+            [
+                (chx - cx0) / norm, (chy - cy0) / norm,
+                char_hp / CHAR_HP_NORM, ammo_total / 500.0,
+            ],
+            dtype=np.float32,
+        )
 
-        # Character
-        char_arr = np.zeros(4, dtype=np.float32)
-        try:
-            health = self._get_character_health()
-            char_arr[0] = ns.player_location.x
-            char_arr[1] = ns.player_location.y
-            char_arr[2] = health
-            char_arr[3] = inv_arr[0]  # firearm-magazine count as proxy
-        except Exception:
-            pass
+        # Radar (normalized; the "heart")
+        radar_hp = self._get_radar_hp()
+        rx = self._radar_position.x if self._radar_position is not None else cx0
+        ry = self._radar_position.y if self._radar_position is not None else cy0
+        radar_arr = np.array(
+            [(rx - cx0) / norm, (ry - cy0) / norm, radar_hp / RADAR_HP_NORM],
+            dtype=np.float32,
+        )
 
-        # Radar
-        radar_arr = np.zeros(3, dtype=np.float32)
-        try:
-            for e in entities:
-                if e.name == "radar":
-                    radar_arr[0] = e.position.x
-                    radar_arr[1] = e.position.y
-                    radar_arr[2] = getattr(e, "health", 0)
-                    break
-        except Exception:
-            pass
+        # Biter groups (swarms) + nests via threat_view
+        (
+            groups_arr, group_valid_mask, nests_arr, nest_valid_mask,
+            threat_closeness,
+        ) = self._build_threat_obs(cx0, cy0, norm, turrets)
 
-        # Game
+        # Movement / transit state
+        movement_arr = np.zeros(MOVEMENT_FEATURES, dtype=np.float32)
+        movement_arr[0] = 1.0 if self._moving else 0.0
+        if self._moving and 0 <= self._move_target < na:
+            tx, ty = self._anchor_slots[self._move_target]
+            rem = math.hypot(tx - chx, ty - chy)
+            rmag = rem if rem > 1e-6 else 1.0
+            movement_arr[1] = self._move_target / float(MAX_ANCHORS)
+            movement_arr[2] = rem / norm
+            movement_arr[3] = (tx - chx) / rmag
+            movement_arr[4] = (ty - chy) / rmag
+
+        # Game (elapsed normalized to [0, 1] over the episode budget)
         elapsed_ticks = self.instance.get_elapsed_ticks()
         game_arr = np.array(
-            [elapsed_ticks, self._wave_number], dtype=np.float32
+            [elapsed_ticks / max(1, self.max_ticks), self._wave_number],
+            dtype=np.float32,
         )
+
+        # Stash raw values for the reward / termination logic.
+        self._cur_char_hp = char_hp
+        self._cur_radar_hp = radar_hp
+        self._cur_coverage = (live_turrets / n) if n > 0 else 0.0
+        self._cur_ammo_frac = (loaded_turrets / live_turrets) if live_turrets > 0 else 0.0
+        self._cur_threat_closeness = threat_closeness
 
         return {
             "map": map_grid,
@@ -765,13 +1017,100 @@ class TowerDefenseEnv(gymnasium.Env):
             "place_slot_mask": place_slot_mask,
             "refill_slot_mask": refill_slot_mask,
             "pick_slot_mask": pick_slot_mask,
+            "place_reach_mask": place_reach_mask,
+            "refill_reach_mask": refill_reach_mask,
+            "pick_reach_mask": pick_reach_mask,
             "anchors": anchors_arr,
             "anchor_valid_mask": anchor_valid_mask,
             "reach_slot_mask": reach_slot_mask,
+            "biter_groups": groups_arr,
+            "group_valid_mask": group_valid_mask,
+            "nests": nests_arr,
+            "nest_valid_mask": nest_valid_mask,
+            "movement": movement_arr,
             "character": char_arr,
             "radar": radar_arr,
             "game": game_arr,
         }
+
+    def _build_threat_obs(self, cx0, cy0, norm, turrets):
+        """Query threat_view and build the biter_groups / nests obs arrays.
+
+        Returns (groups_arr, group_valid_mask, nests_arr, nest_valid_mask,
+        threat_closeness) where threat_closeness is in [0, 1] (1 = a swarm is on
+        top of the base, 0 = none within threat_scan_radius).
+        """
+        groups_arr = np.zeros((MAX_GROUPS, GROUP_FEATURES), dtype=np.float32)
+        group_valid_mask = np.zeros(MAX_GROUPS, dtype=np.int8)
+        nests_arr = np.zeros((MAX_NESTS, NEST_FEATURES), dtype=np.float32)
+        nest_valid_mask = np.zeros(MAX_NESTS, dtype=np.int8)
+        scan_r = float(self.config.threat_scan_radius)
+        closeness = 0.0
+        try:
+            threat = self.instance.first_namespace._threat_view(
+                center_x=cx0,
+                center_y=cy0,
+                radius=scan_r,
+                cell=self.config.threat_cell_size,
+                charted_only=True,
+                max_groups=MAX_GROUPS,
+                max_nests=MAX_NESTS,
+            )
+        except Exception:
+            return groups_arr, group_valid_mask, nests_arr, nest_valid_mask, closeness
+
+        min_dist = float("inf")
+        for i, g in enumerate(threat.get("groups", [])[:MAX_GROUPS]):
+            try:
+                gx, gy, count, spread, vx, vy = g
+            except (ValueError, TypeError):
+                continue
+            rcx, rcy = gx - cx0, gy - cy0
+            dist = math.hypot(rcx, rcy)
+            speed = math.hypot(vx, vy)
+            if speed > 1e-6:
+                hdx, hdy = vx / speed, vy / speed
+                eta = dist / speed
+            else:
+                hdx, hdy, eta = 0.0, 0.0, 2.0 * ETA_NORM
+            d_turret = self._nearest_turret_dist(gx, gy, turrets, scan_r)
+            is_swarm = 1.0 if count >= self.config.swarm_threshold else 0.0
+            groups_arr[i] = [
+                rcx / norm, rcy / norm, count / COUNT_NORM, spread / norm,
+                hdx, hdy, dist / norm, d_turret / norm,
+                min(eta, 2.0 * ETA_NORM) / ETA_NORM, is_swarm,
+            ]
+            group_valid_mask[i] = 1
+            if dist < min_dist:
+                min_dist = dist
+        if min_dist < float("inf") and scan_r > 0:
+            closeness = max(0.0, min(1.0, 1.0 - min_dist / scan_r))
+
+        for i, nst in enumerate(threat.get("nests", [])[:MAX_NESTS]):
+            try:
+                nx, ny, nhp = nst
+            except (ValueError, TypeError):
+                continue
+            rnx, rny = nx - cx0, ny - cy0
+            dist = math.hypot(rnx, rny)
+            dmag = dist if dist > 1e-6 else 1.0
+            nests_arr[i] = [
+                rnx / norm, rny / norm, nhp / NEST_HP_NORM, dist / norm,
+                rnx / dmag, rny / dmag,
+            ]
+            nest_valid_mask[i] = 1
+
+        return groups_arr, group_valid_mask, nests_arr, nest_valid_mask, closeness
+
+    @staticmethod
+    def _nearest_turret_dist(gx, gy, turrets, default):
+        """Distance from (gx, gy) to the nearest live turret (default if none)."""
+        best = float("inf")
+        for (tx, ty, _ammo, _hp) in turrets:
+            d = math.hypot(tx - gx, ty - gy)
+            if d < best:
+                best = d
+        return best if best < float("inf") else default
 
     def _get_character_health(self) -> float:
         """Get the agent character's health via storage.agent_characters[1]."""
@@ -784,47 +1123,59 @@ class TowerDefenseEnv(gymnasium.Env):
         except Exception:
             return 0.0
 
-    def _get_kill_count(self) -> int:
-        """Get total enemy kills."""
-        try:
-            response = self.instance.rcon_client.send_command(
-                "/sc rcon.print(game.forces['player'].kill_count_statistics.input_counts['small-biter'] or 0)"
-            )
-            return int(response)
-        except Exception:
-            return 0
-
     def _compute_reward(self, invalid: bool) -> float:
-        """Compute step reward."""
+        """Compute step reward from server-side death events + stashed raw state.
+
+        Reads (and clears) the death/kill counters accumulated during the last
+        decision window, applies the destruction penalties you specified, the
+        character/radar damage penalties, and light dense shaping that anneals to
+        zero over cfg.shaping_decay_steps. Stashes the events for _check_terminated.
+        """
         cfg = self.config
         reward = 0.0
 
-        # Survival bonus
+        # Survival.
         reward += cfg.alpha_survive
 
-        # Kill bonus
-        kills = self._get_kill_count()
-        delta_kills = kills - self._prev_kills
-        self._prev_kills = kills
-        reward += cfg.beta_kills * delta_kills
+        # Event-based kills + destruction (read-and-clear for this window).
+        ev = self._read_events()
+        self._last_events = ev
+        reward += cfg.beta_kills * ev.get("kills", 0)
+        reward -= cfg.p_wall_destroyed * ev.get("walls_lost", 0)
+        reward -= cfg.p_turret_destroyed * ev.get("turrets_lost", 0)
+        reward -= cfg.p_building_destroyed * ev.get("buildings_lost", 0)
 
-        # Damage penalty
-        health = self._get_character_health()
-        damage_taken = max(0, self._prev_health - health)
-        self._prev_health = health
+        # Character damage (raw HP, stashed during _get_observation).
+        damage_taken = max(0.0, self._prev_health - self._cur_char_hp)
+        self._prev_health = self._cur_char_hp
         reward -= cfg.delta_damage * damage_taken
 
-        # Invalid action penalty
+        # Radar damage (the heart).
+        radar_damage = max(0.0, self._prev_radar_hp - self._cur_radar_hp)
+        self._prev_radar_hp = self._cur_radar_hp
+        reward -= cfg.p_radar_damage * radar_damage
+
+        # Invalid action penalty.
         if invalid:
             reward -= cfg.epsilon_invalid
+
+        # Dense shaping, annealed to 0 over training.
+        decay = max(0.0, 1.0 - self._total_steps / max(1, cfg.shaping_decay_steps))
+        if decay > 0.0:
+            reward += decay * cfg.w_coverage * self._cur_coverage
+            reward += decay * cfg.w_ammo * self._cur_ammo_frac
+            reward -= decay * cfg.w_threat * self._cur_threat_closeness
 
         return reward
 
     def _check_terminated(self, obs: Dict[str, np.ndarray]) -> bool:
-        """Check if episode should terminate."""
-        if self._has_radar and obs["radar"][2] <= 0 and self._step_count > 1:
+        """Terminate on radar destruction or character death."""
+        if self._step_count <= 1:
+            return False
+        ev = getattr(self, "_last_events", {}) or {}
+        if self._has_radar and (self._cur_radar_hp <= 0 or ev.get("radar_lost", 0) > 0):
             return True
-        if obs["character"][2] <= 0 and self._step_count > 1:
+        if self._cur_char_hp <= 0 or ev.get("char_died", 0) > 0:
             return True
         return False
 

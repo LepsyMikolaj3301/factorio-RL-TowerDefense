@@ -22,6 +22,19 @@ storage.actions.radar_view = function(player_index, center_x, center_y, radius, 
         end
     end
 
+    -- Helper: ACCUMULATE a value at (channel, row, col), clipped to 255. Used for
+    -- the biter/spitter channels so a dense swarm reads as a high-intensity blob
+    -- (distinguishable from scattered stragglers, and never confused with the
+    -- single-point nest channel).
+    local function add_grid(ch, row, col, val)
+        if row >= 0 and row < grid_size and col >= 0 and col < grid_size then
+            local idx = ch * grid_size * grid_size + row * grid_size + col + 1
+            grid[idx] = math.min(255, grid[idx] + val)
+        end
+    end
+    -- Per-unit intensity for the count-valued enemy channels (4 units saturate a cell).
+    local UNIT_INTENSITY = 64
+
     -- Convert world position to grid position
     local function world_to_grid(wx, wy)
         local col = math.floor((wx - center_x + radius) / cell_size)
@@ -84,9 +97,9 @@ storage.actions.radar_view = function(player_index, center_x, center_y, radius, 
 
             if etype == "unit" then
                 if string.find(ename, "biter") then
-                    set_grid(4, row, col, 255)
+                    add_grid(4, row, col, UNIT_INTENSITY)
                 elseif string.find(ename, "spitter") then
-                    set_grid(5, row, col, 255)
+                    add_grid(5, row, col, UNIT_INTENSITY)
                 end
             elseif etype == "unit-spawner" then
                 set_grid(6, row, col, 255)
