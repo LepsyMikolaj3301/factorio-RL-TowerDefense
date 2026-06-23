@@ -18,16 +18,6 @@ def log_info(message):
     print(message, file=sys.stderr)
 
 
-# async def initialize_servers_if_needed():
-#     """Make sure we've initialized servers at least once"""
-#     global _initialized
-#     async with _initialization_lock:
-#         if not _initialized:
-#             await state.scan_for_servers()
-#             _initialized = True
-#
-
-
 # Handle initialization at session start
 async def initialize_session(ctx=None):
     """Automatically initializes the Factorio server when a session begins"""

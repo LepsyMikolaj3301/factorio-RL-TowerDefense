@@ -13,7 +13,6 @@ from fle.env.lua_manager import LuaScriptManager
 class MoveTo(Tool):
     def __init__(self, connection: LuaScriptManager, game_state):
         super().__init__(connection, game_state)
-        # self.observe = ObserveAll(connection, game_state)
         self.request_path = RequestPath(connection, game_state)
         self.get_path = GetPath(connection, game_state)
 

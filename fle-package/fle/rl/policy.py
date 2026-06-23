@@ -3,7 +3,7 @@
 The v1 model is a custom multi-input feature extractor (`TDExtractor`) plus a
 pointer scoring head (`PointerHead`), trained with MaskablePPO (sb3-contrib).
 
-Architecture (see the design plan, Part D):
+Architecture:
 
     map (8x64x64)  -> CoordConv CNN ----\
     turret_slots   -> DeepSets ----------+

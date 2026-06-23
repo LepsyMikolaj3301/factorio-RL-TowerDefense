@@ -11,15 +11,15 @@ import gymnasium
 from gymnasium import spaces
 
 # --- Action constants ---
-# The action set is limited to the three meaningful turret decisions
-# (pick a turret up, place one down, feed ammo to one) plus a no-op. Walls and
-# direct shooting are intentionally not exposed to the policy.
+# The action set is limited to meaningful turret decisions plus movement/no-op.
+# Walls and direct shooting are intentionally not exposed to the policy.
 ACTION_NOOP = 0
 ACTION_PICK_TURRET = 1     # mine the turret in a slot back into the agent inventory
 ACTION_PLACE_TURRET = 2    # place an inventory turret into an empty slot
 ACTION_REFILL_TURRET = 3   # insert ammo into the turret standing in a slot
 ACTION_MOVE_ANCHOR = 4     # teleport the character onto a chosen anchor tile
-NUM_ACTION_TYPES = 5
+ACTION_TAKE_AMMO = 5       # remove configured ammo from a turret without mining it
+NUM_ACTION_TYPES = 6
 
 # --- Observation grid ---
 NUM_CHANNELS = 8  # empty, wall, turret, ammo_pct, biter, spitter, spawner, character
@@ -35,6 +35,10 @@ TRACKED_ITEMS = [
 
 # Max turret slots read from the map (padding target for the slot arrays).
 MAX_SLOTS = 64
+
+# Discrete ammo amount factor: 0-50, with action execution clamping 0 to 1 for
+# actions where an amount is meaningful.
+AMMO_AMOUNT_LEVELS = 51
 
 # Per-slot feature width: [x, y, occupied, ammo, health]
 SLOT_FEATURES = 5
@@ -123,12 +127,16 @@ def make_observation_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.Dict:
             "refill_slot_mask": spaces.MultiBinary(MAX_SLOTS),
             # Real slots that currently hold a turret (valid PICK_TURRET targets).
             "pick_slot_mask": spaces.MultiBinary(MAX_SLOTS),
+            # Real slots that currently hold a turret with removable configured
+            # ammo (valid TAKE_AMMO targets).
+            "take_ammo_slot_mask": spaces.MultiBinary(MAX_SLOTS),
             # Action-conditioned reach masks: the per-action slot mask AND'd with
             # reach_slot_mask. The pointer head consumes these directly so it can
             # never select an out-of-reach slot for the chosen action type.
             "place_reach_mask": spaces.MultiBinary(MAX_SLOTS),
             "refill_reach_mask": spaces.MultiBinary(MAX_SLOTS),
             "pick_reach_mask": spaces.MultiBinary(MAX_SLOTS),
+            "take_ammo_reach_mask": spaces.MultiBinary(MAX_SLOTS),
             # One row per anchor tile read from the map. (x, y) is the tile
             # center; padding rows beyond the real anchor count are zero.
             "anchors": spaces.Box(
@@ -214,7 +222,7 @@ def make_action_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.Dict:
         {
             "action_type": spaces.Discrete(NUM_ACTION_TYPES),
             "slot_index": spaces.Discrete(MAX_SLOTS),
-            "ammo_amount": spaces.Discrete(51),  # 0-50
+            "ammo_amount": spaces.Discrete(AMMO_AMOUNT_LEVELS),  # 0-50
             "anchor_index": spaces.Discrete(MAX_ANCHORS),
         }
     )
@@ -222,7 +230,9 @@ def make_action_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.Dict:
 
 def flatten_action_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.MultiDiscrete:
     """Alternative flat action space for algorithms that don't support Dict."""
-    return spaces.MultiDiscrete([NUM_ACTION_TYPES, MAX_SLOTS, 51, MAX_ANCHORS])
+    return spaces.MultiDiscrete(
+        [NUM_ACTION_TYPES, MAX_SLOTS, AMMO_AMOUNT_LEVELS, MAX_ANCHORS]
+    )
 
 
 class FlatTDActionWrapper(gymnasium.Wrapper):

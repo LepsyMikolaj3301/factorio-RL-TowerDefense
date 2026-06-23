@@ -13,6 +13,7 @@ class TrainConfig:
     # reset (None = keep the save's value). See TDScenarioConfig.
     evolution_factor: Optional[float] = None   # enemy evolution (0..1)
     max_unit_group_size: Optional[int] = None  # cap on biters per attack group
+    game_speed: Optional[float] = None  # override scenario game_speed; None = config default
     save_path: Optional[str] = None     # prebuilt Factorio save (else container default)
     num_envs: int = 1                   # parallel containers
     use_subproc: bool = True            # SubprocVecEnv when num_envs > 1
@@ -60,6 +61,7 @@ class EvalConfig:
     """All knobs for `fle.rl.eval`. Runs one episode of a trained model (no learning)."""
 
     model_path: str                      # required: path to a saved .zip (final_model/best/checkpoint)
+    difficulty: str = "medium"           # easy | medium | hard; should match training
     # Difficulty knobs applied on world init + every reset (None = save default).
     evolution_factor: Optional[float] = None   # enemy evolution (0..1)
     max_unit_group_size: Optional[int] = None  # cap on biters per attack group

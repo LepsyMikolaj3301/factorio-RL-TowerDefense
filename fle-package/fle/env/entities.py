@@ -172,10 +172,6 @@ class Inventory(BaseModel):
         populate_by_name=True, arbitrary_types_allowed=True, extra="allow"
     )
 
-    # def __init__(self, **data):
-    #     super().__init__()
-    #     self.__dict__.update(data)
-
     def __getitem__(self, key: "Prototype", default=None) -> int:  # noqa
         try:
             if hasattr(key, "value"):
@@ -186,7 +182,6 @@ class Inventory(BaseModel):
                 name = key
         except Exception:
             name = key
-        # return self.__dict__[name] if name in self.__dict__ else 0
         if hasattr(self, "__pydantic_extra__"):
             return self.__pydantic_extra__.get(name, 0)
         return getattr(self, name, 0)

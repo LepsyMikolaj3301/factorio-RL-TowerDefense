@@ -33,9 +33,6 @@ class PlaceObject(Tool):
         :return: Entity object
         """
 
-        # if not isinstance(entity, Prototype):
-        #    raise ValueError("The first argument must be a Prototype object")
-
         # If position is a tuple, cast it to a Position object:
         if isinstance(position, tuple):
             position = Position(x=position[0], y=position[1])

@@ -1,4 +1,4 @@
-"""Tower Defense RL training pipeline (the real deal).
+"""Tower Defense RL training pipeline.
 
 Canonical entry point:
 
@@ -21,9 +21,6 @@ from typing import List
 from fle.rl.config import TrainConfig
 
 
-# ---------------------------------------------------------------------------
-# Env construction
-# ---------------------------------------------------------------------------
 def _scenario_config(cfg):
     """Build the TD scenario config from the difficulty knobs (evolution factor
     + biter group size). Starts from the base config; None leaves save defaults."""
@@ -35,6 +32,9 @@ def _scenario_config(cfg):
         TDScenarioConfig(),
         evolution_factor=cfg.evolution_factor,
         max_unit_group_size=cfg.max_unit_group_size,
+        game_speed=cfg.game_speed
+        if cfg.game_speed is not None
+        else TDScenarioConfig().game_speed,
     )
 
 
@@ -77,9 +77,6 @@ def _build_vec_env(cfg: TrainConfig, thunks: List):
     return venv
 
 
-# ---------------------------------------------------------------------------
-# Metrics callback
-# ---------------------------------------------------------------------------
 def _make_metrics_callback():
     from stable_baselines3.common.callbacks import BaseCallback
 
@@ -98,6 +95,9 @@ def _make_metrics_callback():
                 "walls_lost_episode",
                 "turrets_lost_episode",
                 "coverage",
+                "threatened_turret_readiness",
+                "early_setup_reward",
+                "ammo_taken",
                 "invalid_action",
                 "wall_n",
                 "wall_e",
@@ -111,7 +111,7 @@ def _make_metrics_callback():
                 vals = [i[key] for i in infos if key in i]
                 if vals:
                     self.logger.record_mean(f"td/{key}", float(sum(vals) / len(vals)))
-            for action in ("noop", "pick", "place", "refill", "move"):
+            for action in ("noop", "pick", "place", "refill", "move", "take_ammo"):
                 vals = [1.0 if i.get("action_name") == action else 0.0 for i in infos]
                 if vals:
                     self.logger.record_mean(f"td/action_{action}", float(sum(vals) / len(vals)))
@@ -156,14 +156,12 @@ def _print_device_summary(model, requested_device: str) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Train
-# ---------------------------------------------------------------------------
 def train(cfg: TrainConfig):
     from sb3_contrib import MaskablePPO
     from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
     from stable_baselines3.common.utils import set_random_seed
 
+    from fle.env.gym_env.td_spaces import NUM_ACTION_TYPES
     from fle.rl.policy import make_td_policy_kwargs
 
     set_random_seed(cfg.seed)
@@ -219,6 +217,14 @@ def train(cfg: TrainConfig):
 
     if cfg.resume:
         model = MaskablePPO.load(cfg.resume, env=venv, device=cfg.device)
+        saved_nvec = getattr(getattr(model, "action_space", None), "nvec", None)
+        if saved_nvec is not None and int(saved_nvec[0]) != NUM_ACTION_TYPES:
+            raise ValueError(
+                f"Incompatible TD checkpoint action space: model has "
+                f"{int(saved_nvec[0])} action types, environment expects "
+                f"{NUM_ACTION_TYPES}. Start a new 6-action run or select a "
+                "compatible checkpoint."
+            )
     else:
         model = MaskablePPO(
             "MultiInputPolicy",
@@ -266,6 +272,8 @@ def _parse_args(argv=None) -> TrainConfig:
                    help="Enemy evolution factor 0..1 (default: keep the save's value)")
     p.add_argument("--group-size", type=int, default=None,
                    help="Max biters per attack group (default: engine default)")
+    p.add_argument("--game-speed", type=float, default=None,
+                   help="Factorio game speed during training; lower values are easier to watch")
     p.add_argument("--save-path", default=None)
     p.add_argument("--num-envs", type=int, default=1)
     p.add_argument("--no-subproc", action="store_true", help="Force DummyVecEnv")
@@ -288,6 +296,7 @@ def _parse_args(argv=None) -> TrainConfig:
     return TrainConfig(
         evolution_factor=a.evolution_factor,
         max_unit_group_size=a.group_size,
+        game_speed=a.game_speed,
         save_path=a.save_path,
         num_envs=a.num_envs,
         use_subproc=not a.no_subproc,

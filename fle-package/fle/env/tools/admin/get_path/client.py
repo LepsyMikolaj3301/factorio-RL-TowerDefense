@@ -8,8 +8,6 @@ from fle.env.tools import Tool
 class GetPath(Tool):
     def __init__(self, connection, game_state):
         super().__init__(connection, game_state)
-        # self.connection = connection
-        # self.game_state = game_state
 
     def __call__(self, path_handle: int, max_attempts: int = 10) -> List[Position]:
         """

@@ -10,15 +10,16 @@ from fle.env.gym_env.td_spaces import (
     ACTION_PICK_TURRET,
     ACTION_PLACE_TURRET,
     ACTION_REFILL_TURRET,
+    ACTION_TAKE_AMMO,
+    AMMO_AMOUNT_LEVELS,
     MAX_ANCHORS,
     MAX_SLOTS,
     NUM_ACTION_TYPES,
     TRACKED_ITEMS,
 )
 
-# Number of discrete ammo levels in the flat MultiDiscrete action factor
-# (must match td_spaces.make_action_space / flatten_action_space: Discrete(51)).
-NUM_AMMO_LEVELS = 51
+# Backwards-compatible name for callers/tests that import the mask width here.
+NUM_AMMO_LEVELS = AMMO_AMOUNT_LEVELS
 
 
 class ActionMaskWrapper(gymnasium.Wrapper):
@@ -28,14 +29,15 @@ class ActionMaskWrapper(gymnasium.Wrapper):
 
     - ``action_type_mask`` (shape ``(NUM_ACTION_TYPES,)``): whether each action
       *type* is worth taking at all. PLACE_TURRET needs an empty slot and a
-      turret in inventory; REFILL_TURRET needs an occupied slot and ammo; NOOP
-      is always valid.
+      turret in inventory; REFILL_TURRET needs an occupied slot and ammo;
+      TAKE_AMMO needs an occupied slot with removable ammo; NOOP is always valid.
     - ``slot_mask`` (shape ``(MAX_SLOTS,)``): real slots. Because standard
       MaskablePPO masks each discrete factor independently and cannot condition
       the slot mask on the chosen action type, the per-action validity
       (empty vs occupied) is enforced at execution time via the invalid-action
       penalty. The observation also carries ``place_slot_mask`` /
-      ``refill_slot_mask`` for callers that do custom action-conditioned masking.
+      ``refill_slot_mask`` / ``take_ammo_slot_mask`` for callers that do custom
+      action-conditioned masking.
 
     Compatible with SB3's MaskablePPO via sb3-contrib.
     """
@@ -83,6 +85,7 @@ class ActionMaskWrapper(gymnasium.Wrapper):
         place_reach = obs.get("place_reach_mask", np.zeros(MAX_SLOTS))
         refill_reach = obs.get("refill_reach_mask", np.zeros(MAX_SLOTS))
         pick_reach = obs.get("pick_reach_mask", np.zeros(MAX_SLOTS))
+        take_reach = obs.get("take_ammo_reach_mask", np.zeros(MAX_SLOTS))
 
         # Place: need a turret in inventory AND a reachable empty slot.
         turret_idx = TRACKED_ITEMS.index("gun-turret")
@@ -99,6 +102,10 @@ class ActionMaskWrapper(gymnasium.Wrapper):
         # Pick: need a reachable occupied slot (turret to mine back up).
         if np.any(pick_reach):
             mask[ACTION_PICK_TURRET] = 1
+
+        # Take ammo: need a reachable occupied turret with removable ammo.
+        if np.any(take_reach):
+            mask[ACTION_TAKE_AMMO] = 1
 
         return mask
 
@@ -155,10 +162,12 @@ class ActionMaskWrapper(gymnasium.Wrapper):
         place = obs.get("place_reach_mask", np.zeros(MAX_SLOTS, dtype=np.int8))
         refill = obs.get("refill_reach_mask", np.zeros(MAX_SLOTS, dtype=np.int8))
         pick = obs.get("pick_reach_mask", np.zeros(MAX_SLOTS, dtype=np.int8))
+        take = obs.get("take_ammo_reach_mask", np.zeros(MAX_SLOTS, dtype=np.int8))
         slot_mask = (
             np.asarray(place, np.int8)
             | np.asarray(refill, np.int8)
             | np.asarray(pick, np.int8)
+            | np.asarray(take, np.int8)
         )
         if not slot_mask.any():
             slot_mask[0] = 1  # fallback so the factor is samplable

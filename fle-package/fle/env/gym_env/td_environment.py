@@ -18,6 +18,7 @@ from fle.env.gym_env.td_spaces import (
     ACTION_PICK_TURRET,
     ACTION_PLACE_TURRET,
     ACTION_REFILL_TURRET,
+    ACTION_TAKE_AMMO,
     BOILER_FEATURES,
     BOILER_HP_NORM,
     CHAR_HP_NORM,
@@ -144,11 +145,18 @@ class TowerDefenseEnv(gymnasium.Env):
         self._cur_radar_hp = 0.0
         self._cur_coverage = 0.0       # filled_reachable / total_reachable
         self._cur_ammo_frac = 0.0      # loaded_turrets / live_turrets
+        self._cur_empty_turrets = 0    # live gun-turrets with no configured ammo
         self._cur_threat_closeness = 0.0  # 0 (far) .. 1 (on top of base)
+        self._cur_threatened_turret_readiness = 0.0
         self._last_events: Dict[str, int] = self._zero_events()
         self._episode_events: Dict[str, int] = self._zero_events()
         self._prev_coverage = 0.0
         self._prev_ammo_frac = 0.0
+        self._prev_threatened_turret_readiness = 0.0
+        self._last_early_setup_reward = 0.0
+        self._last_ammo_taken = 0
+        self._cur_slot_threat_alignment = np.ones(MAX_SLOTS, dtype=np.float32)
+        self._cur_has_threat_direction = False
 
         # Canonical turret slots, read once from the map on first reset.
         # Shape (N, 2): the (x, y) center of every slot. Never changes for a run.
@@ -242,7 +250,6 @@ class TowerDefenseEnv(gymnasium.Env):
             # Precompute which anchors can reach which slots. Static for the run.
             self._build_anchor_reach_matrix()
 
-            # Print a one-time human-readable save validation report.
             self._report_save_state()
 
             # Capture the snapshot with ALL slot turrets present, so each episode
@@ -300,6 +307,7 @@ class TowerDefenseEnv(gymnasium.Env):
         obs = self._get_observation()
         self._prev_coverage = self._cur_coverage
         self._prev_ammo_frac = self._cur_ammo_frac
+        self._prev_threatened_turret_readiness = self._cur_threatened_turret_readiness
         logger.info("reset() — done in %.2fs  slots=%d  anchors=%d  "
                     "char_hp=%.0f  radar_hp=%.0f",
                     _time_module.perf_counter() - t_reset,
@@ -741,6 +749,7 @@ class TowerDefenseEnv(gymnasium.Env):
         cx, cy, r = self._center_x, self._center_y, self._radius
         t0 = _time_module.perf_counter()
         try:
+            ammo_name = self.config.ammo_type.replace("\\", "\\\\").replace("'", "\\'")
             raw = self.instance.rcon_client.send_command(
                 f"/sc local out={{}} "
                 f"for _,e in pairs(game.surfaces[1].find_entities_filtered{{"
@@ -749,8 +758,7 @@ class TowerDefenseEnv(gymnasium.Env):
                 f"}}) do "
                 f"local ammo=0 "
                 f"if e.get_inventory(defines.inventory.turret_ammo) then "
-                f"  ammo=e.get_inventory(defines.inventory.turret_ammo).get_item_count('firearm-magazine') "
-                f"  +e.get_inventory(defines.inventory.turret_ammo).get_item_count('piercing-rounds-magazine') "
+                f"  ammo=e.get_inventory(defines.inventory.turret_ammo).get_item_count('{ammo_name}') "
                 f"end "
                 f"out[#out+1]=e.position.x..','..e.position.y..','..ammo..','..e.health "
                 f"end rcon.print(table.concat(out,';'))"
@@ -1187,17 +1195,6 @@ class TowerDefenseEnv(gymnasium.Env):
         self._last_events = ev
         self._accumulate_episode_events(ev)
 
-        # --- Runtime wave triggering (DISABLED) ---------------------------------
-        # The map already ships with baked-in biter nests that spawn and path to
-        # the base on their own, so we don't drive waves from Python for now.
-        # Kept here (and in _spawn_wave / biter_director) for later development.
-        #
-        # new_wave = int(elapsed_ticks / self.config.ticks_per_wave)
-        # if new_wave > self._wave_number:
-        #     self._wave_number = new_wave
-        #     self._spawn_wave()
-        # -----------------------------------------------------------------------
-
         # Get observation
         t_obs = _time_module.perf_counter()
         obs = self._get_observation()
@@ -1233,6 +1230,7 @@ class TowerDefenseEnv(gymnasium.Env):
             ACTION_PLACE_TURRET: "place",
             ACTION_REFILL_TURRET: "refill",
             ACTION_MOVE_ANCHOR: "move",
+            ACTION_TAKE_AMMO: "take_ammo",
         }
         info = {
             "step": self._step_count,
@@ -1254,6 +1252,10 @@ class TowerDefenseEnv(gymnasium.Env):
             "action_type_id": action_type,
             "action_name": action_names.get(action_type, "unknown"),
             "coverage": self._cur_coverage,
+            "empty_turrets": self._cur_empty_turrets,
+            "threatened_turret_readiness": self._cur_threatened_turret_readiness,
+            "early_setup_reward": self._last_early_setup_reward,
+            "ammo_taken": self._last_ammo_taken,
         }
         for key in (
             "wall_n", "wall_e", "wall_s", "wall_w",
@@ -1294,6 +1296,7 @@ class TowerDefenseEnv(gymnasium.Env):
             ACTION_PLACE_TURRET: "PLACE_TURRET",
             ACTION_REFILL_TURRET: "REFILL_TURRET",
             ACTION_MOVE_ANCHOR: "MOVE_ANCHOR",
+            ACTION_TAKE_AMMO: "TAKE_AMMO",
         }
         atype = int(action.get("action_type", ACTION_NOOP))
         name = _NAMES.get(atype, f"?({atype})")
@@ -1304,12 +1307,13 @@ class TowerDefenseEnv(gymnasium.Env):
             return f"{name}[{anchor}]"
         if atype in (ACTION_PLACE_TURRET, ACTION_PICK_TURRET):
             return f"{name}[s{slot}]"
-        if atype == ACTION_REFILL_TURRET:
+        if atype in (ACTION_REFILL_TURRET, ACTION_TAKE_AMMO):
             return f"{name}[s{slot},a{ammo}]"
         return name
 
     def _execute_action(self, action: Dict[str, Any]) -> bool:
         """Execute the given slot-based action. Returns True if invalid."""
+        self._last_ammo_taken = 0
         action_type = int(action.get("action_type", ACTION_NOOP))
         slot_index = int(action.get("slot_index", 0))
         ammo_amount = int(action.get("ammo_amount", 0))
@@ -1370,12 +1374,67 @@ class TowerDefenseEnv(gymnasium.Env):
                 )
                 return False
 
+            elif action_type == ACTION_TAKE_AMMO:
+                if turret_here is None:
+                    return True  # empty slot, nothing to take from
+                amount = max(1, ammo_amount)
+                taken = self._take_configured_ammo_from_turret(
+                    slot_x,
+                    slot_y,
+                    amount,
+                )
+                if taken <= 0:
+                    return True
+                self._last_ammo_taken = taken
+                return False
+
             else:
                 return True  # Unknown action type
 
         except Exception as e:
             logger.debug(f"Action failed: {e}")
             return True
+
+    def _take_configured_ammo_from_turret(
+        self,
+        slot_x: float,
+        slot_y: float,
+        amount: int,
+    ) -> int:
+        """Move configured ammo from the selected turret to the agent inventory."""
+        ammo_name = self.config.ammo_type.replace("\\", "\\\\").replace("'", "\\'")
+        amount = max(1, int(amount))
+        raw = self.instance.rcon_client.send_command(
+            f"/sc local s=game.surfaces[1] "
+            f"local item='{ammo_name}' "
+            f"local inserted=0 "
+            f"local e=s.find_entities_filtered{{"
+            f"name='gun-turret', position={{{slot_x},{slot_y}}}, "
+            f"radius={float(self._slot_epsilon)}}}[1] "
+            f"if e and e.valid then "
+            f"  local inv=e.get_inventory(defines.inventory.turret_ammo) "
+            f"  if inv then "
+            f"    local available=inv.get_item_count(item) "
+            f"    local take=math.min({amount}, available) "
+            f"    if take > 0 then "
+            f"      local removed=inv.remove{{name=item,count=take}} "
+            f"      if removed > 0 then "
+            f"        local c=storage.agent_characters and storage.agent_characters[1] "
+            f"        if c and c.valid then inserted=c.insert{{name=item,count=removed}} end "
+            f"        if inserted < removed then "
+            f"          inv.insert{{name=item,count=removed-inserted}} "
+            f"        end "
+            f"      end "
+            f"    end "
+            f"  end "
+            f"end "
+            f"rcon.print(inserted)"
+        ).strip()
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            logger.debug("Could not parse ammo-take count: %r", raw)
+            return 0
 
     def _find_turret_at(self, x: float, y: float):
         """Return a GunTurret entity at slot (x, y), or None.
@@ -1556,32 +1615,6 @@ class TowerDefenseEnv(gymnasium.Env):
         except Exception:
             return 0.0
 
-    # --- Runtime wave spawning (DISABLED) -----------------------------------
-    # The map ships with baked-in biter nests that spawn and path to the base on
-    # their own, so we never drive waves from Python. The only call site (in
-    # step()) is already commented out; the method body is kept here, commented,
-    # for later development. Re-enable both together if runtime waves are wanted.
-    #
-    # def _spawn_wave(self):
-    #     """Spawn a wave of enemies using biter_director."""
-    #     if not self.config.spawn_waves_at_runtime:
-    #         return
-    #     try:
-    #         self.instance.first_namespace._biter_director(
-    #             wave_number=self._wave_number,
-    #             center_x=self._center_x,
-    #             center_y=self._center_y,
-    #             spawn_radius=self._radius * 1.5,
-    #             base_count=self.config.base_enemy_count,
-    #             escalation_factor=self.config.escalation_factor,
-    #             use_spawners=self.config.spawn_from_map_spawners,
-    #             target_x=self._center_x,
-    #             target_y=self._center_y,
-    #         )
-    #     except Exception as e:
-    #         logger.warning(f"Failed to spawn wave {self._wave_number}: {e}")
-    # ------------------------------------------------------------------------
-
     def _get_observation(self) -> Dict[str, np.ndarray]:
         """Build the observation dict from game state.
 
@@ -1639,10 +1672,12 @@ class TowerDefenseEnv(gymnasium.Env):
         place_slot_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
         refill_slot_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
         pick_slot_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
+        take_ammo_slot_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
         reach_slot_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
         slots_arr[:, 2] = -1.0  # padding rows: occupied = -1
         live_turrets = 0
         loaded_turrets = 0
+        empty_turrets = 0
         n = 0 if self._turret_slots is None else len(self._turret_slots)
         if n > 0:
             occupied, feats = self._slot_occupancy(turrets)
@@ -1661,7 +1696,10 @@ class TowerDefenseEnv(gymnasium.Env):
                     pick_slot_mask[i] = 1
                     live_turrets += 1
                     if ammo > 0:
+                        take_ammo_slot_mask[i] = 1
                         loaded_turrets += 1
+                    else:
+                        empty_turrets += 1
                 else:
                     place_slot_mask[i] = 1
 
@@ -1671,10 +1709,14 @@ class TowerDefenseEnv(gymnasium.Env):
             place_reach_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
             refill_reach_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
             pick_reach_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
+            take_ammo_reach_mask = np.zeros(MAX_SLOTS, dtype=np.int8)
         else:
             place_reach_mask = (place_slot_mask & reach_slot_mask).astype(np.int8)
             refill_reach_mask = (refill_slot_mask & reach_slot_mask).astype(np.int8)
             pick_reach_mask = (pick_slot_mask & reach_slot_mask).astype(np.int8)
+            take_ammo_reach_mask = (
+                take_ammo_slot_mask & reach_slot_mask
+            ).astype(np.int8)
 
         # Anchors (normalized)
         anchors_arr = np.zeros((MAX_ANCHORS, 2), dtype=np.float32)
@@ -1710,6 +1752,25 @@ class TowerDefenseEnv(gymnasium.Env):
             groups_arr, group_valid_mask, nests_arr, nest_valid_mask,
             threat_closeness,
         ) = self._build_threat_obs(cx0, cy0, norm, turrets)
+        (
+            slot_threat_alignment,
+            has_threat_direction,
+        ) = self._compute_slot_threat_alignment(
+            slots_arr,
+            slot_valid_mask,
+            groups_arr,
+            group_valid_mask,
+            nests_arr,
+            nest_valid_mask,
+        )
+        threatened_turret_readiness = self._compute_threatened_turret_readiness(
+            slots_arr,
+            slot_valid_mask,
+            groups_arr,
+            group_valid_mask,
+            nests_arr,
+            nest_valid_mask,
+        )
 
         # Boilers (critical power targets).
         boilers_arr = np.zeros((MAX_BOILERS, BOILER_FEATURES), dtype=np.float32)
@@ -1764,7 +1825,11 @@ class TowerDefenseEnv(gymnasium.Env):
         self._cur_radar_hp = radar_hp
         self._cur_coverage = (live_turrets / n) if n > 0 else 0.0
         self._cur_ammo_frac = (loaded_turrets / live_turrets) if live_turrets > 0 else 0.0
+        self._cur_empty_turrets = empty_turrets
         self._cur_threat_closeness = threat_closeness
+        self._cur_threatened_turret_readiness = threatened_turret_readiness
+        self._cur_slot_threat_alignment = slot_threat_alignment
+        self._cur_has_threat_direction = has_threat_direction
 
         return {
             "map": map_grid,
@@ -1774,9 +1839,11 @@ class TowerDefenseEnv(gymnasium.Env):
             "place_slot_mask": place_slot_mask,
             "refill_slot_mask": refill_slot_mask,
             "pick_slot_mask": pick_slot_mask,
+            "take_ammo_slot_mask": take_ammo_slot_mask,
             "place_reach_mask": place_reach_mask,
             "refill_reach_mask": refill_reach_mask,
             "pick_reach_mask": pick_reach_mask,
+            "take_ammo_reach_mask": take_ammo_reach_mask,
             "anchors": anchors_arr,
             "anchor_valid_mask": anchor_valid_mask,
             "reach_slot_mask": reach_slot_mask,
@@ -1876,6 +1943,147 @@ class TowerDefenseEnv(gymnasium.Env):
                 best = d
         return best if best < float("inf") else default
 
+    def _compute_threatened_turret_readiness(
+        self,
+        slots_arr: np.ndarray,
+        slot_valid_mask: np.ndarray,
+        groups_arr: np.ndarray,
+        group_valid_mask: np.ndarray,
+        nests_arr: np.ndarray,
+        nest_valid_mask: np.ndarray,
+    ) -> float:
+        """Score armed turret coverage on the side threats are coming from.
+
+        A threat east of the radar should reward occupied, ammo-loaded turret
+        slots east of the radar. Live biter groups are preferred; visible nests
+        act as a weaker fallback before a marching group is present.
+        """
+        slot_valid = slot_valid_mask.astype(bool)
+        if slots_arr.size == 0 or not np.any(slot_valid):
+            return 0.0
+
+        slots = slots_arr[slot_valid]
+        slot_xy = slots[:, :2].astype(np.float32)
+        slot_mag = np.linalg.norm(slot_xy, axis=1)
+        non_center = slot_mag > 1e-6
+        if not np.any(non_center):
+            return 0.0
+
+        slot_unit = np.zeros_like(slot_xy, dtype=np.float32)
+        slot_unit[non_center] = slot_xy[non_center] / slot_mag[non_center, None]
+        occupied = np.clip(slots[:, 2], 0.0, 1.0)
+        ammo_ready = np.clip(slots[:, 3], 0.0, 1.0)
+        # Placement gives partial credit; ammo makes it a real defense.
+        slot_readiness = occupied * (0.4 + 0.6 * ammo_ready)
+
+        def readiness_for(side_xy: np.ndarray) -> Optional[float]:
+            side_mag = float(np.linalg.norm(side_xy))
+            if side_mag <= 1e-6:
+                return None
+            side_unit = side_xy / side_mag
+            side_weights = np.clip(slot_unit @ side_unit, 0.0, 1.0) ** 2
+            side_weights[~non_center] = 0.0
+            total_weight = float(side_weights.sum())
+            if total_weight <= 1e-6:
+                return 0.0
+            return float(np.dot(side_weights, slot_readiness) / total_weight)
+
+        weighted_score = 0.0
+        total_threat_weight = 0.0
+        scan_norm = float(self.config.threat_scan_radius) / max(1.0, self._norm)
+        group_valid = group_valid_mask.astype(bool)
+        for group in groups_arr[group_valid]:
+            score = readiness_for(group[:2].astype(np.float32))
+            if score is None:
+                continue
+            dist_norm = max(0.0, float(group[6]))
+            closeness = 0.0
+            if scan_norm > 1e-6:
+                closeness = max(0.0, 1.0 - min(1.0, dist_norm / scan_norm))
+            count_weight = max(0.1, float(group[2]))
+            swarm_bonus = 1.5 if float(group[9]) > 0.5 else 1.0
+            threat_weight = count_weight * (0.25 + closeness) * swarm_bonus
+            weighted_score += threat_weight * score
+            total_threat_weight += threat_weight
+
+        if total_threat_weight > 1e-6:
+            return max(0.0, min(1.0, weighted_score / total_threat_weight))
+
+        nest_valid = nest_valid_mask.astype(bool)
+        for nest in nests_arr[nest_valid]:
+            score = readiness_for(nest[:2].astype(np.float32))
+            if score is None:
+                continue
+            dist_norm = max(0.0, float(nest[3]))
+            threat_weight = 1.0 / (1.0 + dist_norm)
+            weighted_score += threat_weight * score
+            total_threat_weight += threat_weight
+
+        if total_threat_weight <= 1e-6:
+            return 0.0
+        return max(0.0, min(1.0, weighted_score / total_threat_weight))
+
+    def _compute_slot_threat_alignment(
+        self,
+        slots_arr: np.ndarray,
+        slot_valid_mask: np.ndarray,
+        groups_arr: np.ndarray,
+        group_valid_mask: np.ndarray,
+        nests_arr: np.ndarray,
+        nest_valid_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, bool]:
+        """Return per-slot alignment with the currently suspected attack side."""
+        alignment = np.ones(MAX_SLOTS, dtype=np.float32)
+        slot_valid = slot_valid_mask.astype(bool)
+        if slots_arr.size == 0 or not np.any(slot_valid):
+            return alignment, False
+
+        threat_vectors = []
+        scan_norm = float(self.config.threat_scan_radius) / max(1.0, self._norm)
+        group_valid = group_valid_mask.astype(bool)
+        for group in groups_arr[group_valid]:
+            side_xy = group[:2].astype(np.float32)
+            side_mag = float(np.linalg.norm(side_xy))
+            if side_mag <= 1e-6:
+                continue
+            dist_norm = max(0.0, float(group[6]))
+            closeness = 0.0
+            if scan_norm > 1e-6:
+                closeness = max(0.0, 1.0 - min(1.0, dist_norm / scan_norm))
+            count_weight = max(0.1, float(group[2]))
+            swarm_bonus = 1.5 if float(group[9]) > 0.5 else 1.0
+            weight = count_weight * (0.25 + closeness) * swarm_bonus
+            threat_vectors.append((side_xy / side_mag, weight))
+
+        if not threat_vectors:
+            nest_valid = nest_valid_mask.astype(bool)
+            for nest in nests_arr[nest_valid]:
+                side_xy = nest[:2].astype(np.float32)
+                side_mag = float(np.linalg.norm(side_xy))
+                if side_mag <= 1e-6:
+                    continue
+                dist_norm = max(0.0, float(nest[3]))
+                weight = 1.0 / (1.0 + dist_norm)
+                threat_vectors.append((side_xy / side_mag, weight))
+
+        total_weight = sum(weight for _unit, weight in threat_vectors)
+        if total_weight <= 1e-6:
+            return alignment, False
+
+        alignment[:] = 0.0
+        for idx in np.flatnonzero(slot_valid):
+            slot_xy = slots_arr[idx, :2].astype(np.float32)
+            slot_mag = float(np.linalg.norm(slot_xy))
+            if slot_mag <= 1e-6:
+                continue
+            slot_unit = slot_xy / slot_mag
+            score = 0.0
+            for side_unit, weight in threat_vectors:
+                score += weight * (max(0.0, float(np.dot(slot_unit, side_unit))) ** 2)
+            alignment[idx] = max(0.0, min(1.0, score / total_weight))
+
+        return alignment, True
+
     def _get_character_health(self) -> float:
         """Get the agent character's health via storage.agent_characters[1]."""
         try:
@@ -1922,6 +2130,10 @@ class TowerDefenseEnv(gymnasium.Env):
         if invalid:
             reward -= cfg.epsilon_invalid
 
+        # Empty gun-turrets look like defenses but cannot shoot, so penalize each
+        # occupied slot that has no configured ammo loaded this step.
+        reward -= cfg.p_empty_turret * self._cur_empty_turrets
+
         # Movement penalties. A move command has a small fixed cost; remaining
         # in transit costs a little each decision window so repeated/long moves
         # do not dominate training.
@@ -1931,16 +2143,38 @@ class TowerDefenseEnv(gymnasium.Env):
         if self._moving:
             reward -= cfg.p_move_transit
 
+        early_setup_reward = 0.0
+        if not invalid and self._step_count <= cfg.early_turret_setup_steps:
+            if action_type == ACTION_PLACE_TURRET:
+                early_setup_reward = cfg.w_early_place_turret
+            elif action_type == ACTION_REFILL_TURRET:
+                early_setup_reward = cfg.w_early_refill_turret
+            if early_setup_reward > 0.0 and self._cur_has_threat_direction:
+                slot_index = int((action or {}).get("slot_index", 0))
+                if 0 <= slot_index < len(self._cur_slot_threat_alignment):
+                    early_setup_reward *= float(self._cur_slot_threat_alignment[slot_index])
+                else:
+                    early_setup_reward = 0.0
+        reward += early_setup_reward
+        self._last_early_setup_reward = early_setup_reward
+
         # Dense shaping, annealed to 0 over training.
         decay = max(0.0, 1.0 - self._total_steps / max(1, cfg.shaping_decay_steps))
         if decay > 0.0:
             coverage_delta = max(0.0, self._cur_coverage - self._prev_coverage)
             ammo_delta = max(0.0, self._cur_ammo_frac - self._prev_ammo_frac)
+            threatened_delta = max(
+                0.0,
+                self._cur_threatened_turret_readiness
+                - self._prev_threatened_turret_readiness,
+            )
             reward += decay * cfg.w_coverage_delta * coverage_delta
             reward += decay * cfg.w_ammo_delta * ammo_delta
+            reward += decay * cfg.w_threatened_turret_delta * threatened_delta
             reward -= decay * cfg.w_threat * self._cur_threat_closeness
         self._prev_coverage = self._cur_coverage
         self._prev_ammo_frac = self._cur_ammo_frac
+        self._prev_threatened_turret_readiness = self._cur_threatened_turret_readiness
 
         return reward
 

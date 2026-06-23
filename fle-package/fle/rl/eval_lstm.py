@@ -1,30 +1,17 @@
-"""Tower Defense RL evaluation pipeline (inference, no training).
+"""Masked PPO-LSTM evaluation pipeline (inference, no training) — v2 model.
 
-Take an already-trained model and run it on the scenario exactly as during
-training, ending when the episode terminates (radar destroyed, boiler loss, or
-character death) or truncates (max ticks reached).
+Recurrent sibling of :mod:`fle.rl.eval`. Loads a ``.pt`` checkpoint saved by
+``fle.rl.train_lstm``, runs one episode on a single env carrying the LSTM hidden
+state across steps and resetting it on episode boundaries.
 
-Canonical entry point:
-
-    # Start a container first (loads data/saves/tower_defense.zip):
+    # Start a container first:
     fle cluster start -n 1
 
-    # Evaluate a saved model on one episode:
-    python -m fle.rl.eval --model td_runs/<run>/final_model.zip --difficulty medium
+    # Evaluate:
+    python -m fle.rl.eval_lstm --model td_runs/<run>_lstm/final_model.pt --evolution-factor 0.5
 
     # Slow the game down to watch it play:
-    python -m fle.rl.eval --model td_runs/<run>/final_model.zip --game-speed 1.0
-
-Requires the RL extra (``pip install 'fle[rl]'``) for ``sb3-contrib``
-(MaskablePPO). The model is loaded with the same wrapper stack used in
-training (``FlatTDActionWrapper`` -> ``ActionMaskWrapper``), so the policy sees
-the observation/action shapes it was trained on.
-
-Difficulty should match training's ``--difficulty`` preset. Optional
-``--evolution-factor`` and ``--group-size`` overrides are applied on top, and
-default to the selected preset/save values when omitted. The observation and
-action spaces are independent of these knobs, so any saved model loads
-regardless.
+    python -m fle.rl.eval_lstm --model td_runs/<run>_lstm/final_model.pt --game-speed 1.0
 """
 
 import argparse
@@ -34,26 +21,19 @@ import math
 import os
 import time
 from dataclasses import fields
-from typing import Optional
 
 import numpy as np
+import torch
 
-from fle.rl.config import EvalConfig
-from fle.env.gym_env.td_spaces import NUM_ACTION_TYPES
+from fle.rl.lstm_config import RecurrentEvalConfig
+from fle.rl.lstm_policy import ACTION_FACTORS, ACTION_MASK_DIM, build_agent
 
 
-def _scenario_config(cfg: EvalConfig):
-    """Build the TD scenario config using the same preset path as training."""
+def _scenario_config(cfg: RecurrentEvalConfig):
     from fle.env.gym_env.td_config import TDScenarioConfig
 
-    base = {
-        "easy": TDScenarioConfig.EASY,
-        "medium": TDScenarioConfig.MEDIUM,
-        "hard": TDScenarioConfig.HARD,
-    }[cfg.difficulty]
-
     scenario = dataclasses.replace(
-        base,
+        TDScenarioConfig(),
         evolution_factor=cfg.evolution_factor,
         max_unit_group_size=cfg.max_unit_group_size,
     )
@@ -62,26 +42,49 @@ def _scenario_config(cfg: EvalConfig):
     return scenario
 
 
-def _make_eval_env(cfg: EvalConfig):
-    """Build one fully-wrapped, maskable TD env (single, not vectorized)."""
+def _make_eval_env(cfg: RecurrentEvalConfig):
     from fle.env.gym_env.registry import make_td_env
     from fle.env.gym_env.td_spaces import FlatTDActionWrapper
     from fle.env.gym_env.action_mask import ActionMaskWrapper
 
-    scenario = _scenario_config(cfg)
-
-    env = make_td_env(
-        run_idx=cfg.run_idx,
-        save_path=cfg.save_path,
-        config=scenario,
-    )
-    env = FlatTDActionWrapper(env)      # Dict -> MultiDiscrete
-    env = ActionMaskWrapper(env)        # adds masks + action_masks()
+    env = make_td_env(run_idx=cfg.run_idx, save_path=cfg.save_path, config=_scenario_config(cfg))
+    env = FlatTDActionWrapper(env)
+    env = ActionMaskWrapper(env)
     return env
 
 
+def _resolve_device(requested: str) -> torch.device:
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(requested)
+
+
+def _obs_to_tensors(obs: dict, device) -> dict:
+    """Single-env obs dict -> batched (1, *) tensors on device."""
+    return {k: torch.as_tensor(v, device=device).unsqueeze(0) for k, v in obs.items()}
+
+
+def _assert_checkpoint_action_space(ckpt: dict, path: str) -> None:
+    saved_factors = ckpt.get("action_factors")
+    saved_dim = ckpt.get("action_mask_dim")
+    if saved_factors is None:
+        first_head = ckpt.get("model_state", {}).get("actor_heads.0.weight")
+        if first_head is not None:
+            saved_factors = [int(first_head.shape[0]), *ACTION_FACTORS[1:]]
+    if saved_factors is not None and list(saved_factors) != list(ACTION_FACTORS):
+        raise ValueError(
+            f"Incompatible LSTM checkpoint action factors in {path}: checkpoint "
+            f"has {list(saved_factors)}, environment expects {list(ACTION_FACTORS)}. "
+            "Start a new 6-action run or select a compatible checkpoint."
+        )
+    if saved_dim is not None and int(saved_dim) != ACTION_MASK_DIM:
+        raise ValueError(
+            f"Incompatible LSTM checkpoint mask dim in {path}: checkpoint has "
+            f"{int(saved_dim)}, environment expects {ACTION_MASK_DIM}."
+        )
+
+
 def _end_reason(env, obs: dict, terminated: bool, truncated: bool, hit_cap: bool) -> str:
-    """Classify why the episode ended, from the final observation."""
     if truncated:
         return "time_limit"
     if hit_cap and not terminated:
@@ -93,7 +96,6 @@ def _end_reason(env, obs: dict, terminated: bool, truncated: bool, hit_cap: bool
     if radar.shape[0] >= 3 and float(radar[2]) <= 0.0:
         return "radar_destroyed"
 
-    # Boiler loss threshold (mirror _check_terminated in td_environment.py).
     boiler_valid = obs.get("boiler_valid_mask")
     boiler_rows = obs.get("boilers")
     if boiler_valid is not None and boiler_rows is not None:
@@ -110,44 +112,39 @@ def _end_reason(env, obs: dict, terminated: bool, truncated: bool, hit_cap: bool
     char = np.asarray(obs.get("character", [0, 0, 1.0, 0]))
     if char.shape[0] >= 3 and float(char[2]) <= 0.0:
         return "character_died"
-
     return "terminated"
 
 
-def evaluate(cfg: EvalConfig) -> dict:
-    from sb3_contrib import MaskablePPO
-    from stable_baselines3.common.utils import set_random_seed
-
-    set_random_seed(cfg.seed)
+def evaluate(cfg: RecurrentEvalConfig) -> dict:
+    device = _resolve_device(cfg.device)
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
 
     model_stem = os.path.splitext(os.path.basename(cfg.model_path))[0]
-    run_name = cfg.run_name or f"eval_{model_stem}"
+    run_name = cfg.run_name or f"eval_{model_stem}_lstm"
     run_dir = os.path.join(cfg.log_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
     output_json = cfg.output_json or os.path.join(run_dir, "eval_results.json")
 
-    print(f"[fle.rl.eval] model={cfg.model_path} | difficulty={cfg.difficulty} | "
-          f"evolution={cfg.evolution_factor} | group_size={cfg.max_unit_group_size} | "
-          f"deterministic={cfg.deterministic} | device={cfg.device} | run_dir={run_dir}")
+    print(f"[fle.rl.eval_lstm] model={cfg.model_path} | evolution={cfg.evolution_factor} | "
+          f"group_size={cfg.max_unit_group_size} | device={device} | run_dir={run_dir}")
 
     env = _make_eval_env(cfg)
-    model = MaskablePPO.load(cfg.model_path, device=cfg.device)
-    saved_nvec = getattr(getattr(model, "action_space", None), "nvec", None)
-    if saved_nvec is not None and int(saved_nvec[0]) != NUM_ACTION_TYPES:
-        raise ValueError(
-            f"Incompatible TD checkpoint action space: model has {int(saved_nvec[0])} "
-            f"action types, environment expects {NUM_ACTION_TYPES}. "
-            "Start a new 6-action run or select a compatible checkpoint."
-        )
-    print(f"[fle.rl.eval] loaded model on device={model.device}")
+
+    ckpt = torch.load(cfg.model_path, map_location=device)
+    _assert_checkpoint_action_space(ckpt, cfg.model_path)
+    agent = build_agent(env.observation_space, ckpt["model_kwargs"]).to(device)
+    agent.load_state_dict(ckpt["model_state"])
+    agent.eval()
+    print(f"[fle.rl.eval_lstm] loaded model (step {ckpt.get('global_step', '?')}) on {device}")
 
     obs, info = env.reset(seed=cfg.seed)
+    next_obs = _obs_to_tensors(obs, device)
+    lstm_state = agent.initial_state(1, device)
+    done_t = torch.zeros(1, device=device)
 
     total_reward = 0.0
-    total_kills = 0
-    total_turrets_lost = 0
-    total_walls_lost = 0
-    total_boilers_lost = 0
+    total_kills = total_turrets_lost = total_walls_lost = total_boilers_lost = 0
     invalid_count = 0
     action_counts = {
         "noop": 0,
@@ -157,8 +154,7 @@ def evaluate(cfg: EvalConfig) -> dict:
         "move": 0,
         "take_ammo": 0,
     }
-    last_ticks = 0
-    last_wave = 0
+    last_ticks = last_wave = 0
     last_coverage = 0.0
 
     terminated = truncated = hit_cap = False
@@ -166,9 +162,15 @@ def evaluate(cfg: EvalConfig) -> dict:
     t_episode = time.perf_counter()
 
     while True:
-        masks = env.action_masks()
-        action, _ = model.predict(obs, action_masks=masks, deterministic=cfg.deterministic)
-        obs, reward, terminated, truncated, info = env.step(action)
+        mask = torch.as_tensor(
+            env.action_masks(), dtype=torch.float32, device=device
+        ).unsqueeze(0)
+        with torch.no_grad():
+            action, _, _, _, lstm_state = agent.get_action_and_value(
+                next_obs, lstm_state, done_t, mask, deterministic=cfg.deterministic
+            )
+        action_np = action.squeeze(0).cpu().numpy()
+        obs, reward, terminated, truncated, info = env.step(action_np)
         step += 1
 
         total_reward += float(reward)
@@ -185,6 +187,11 @@ def evaluate(cfg: EvalConfig) -> dict:
         last_wave = int(info.get("wave", last_wave))
         last_coverage = float(info.get("coverage", last_coverage))
 
+        next_obs = _obs_to_tensors(obs, device)
+        done_t = torch.as_tensor(
+            [1.0 if (terminated or truncated) else 0.0], device=device
+        )  # resets hidden on the next forward at an episode boundary
+
         if terminated or truncated:
             break
         if step >= cfg.max_steps:
@@ -196,7 +203,6 @@ def evaluate(cfg: EvalConfig) -> dict:
 
     results = {
         "model_path": cfg.model_path,
-        "difficulty": cfg.difficulty,
         "evolution_factor": cfg.evolution_factor,
         "max_unit_group_size": cfg.max_unit_group_size,
         "deterministic": cfg.deterministic,
@@ -219,12 +225,11 @@ def evaluate(cfg: EvalConfig) -> dict:
         "wall_time_s": wall_time,
         "config": {f.name: getattr(cfg, f.name) for f in fields(cfg)},
     }
-
     _print_summary(results)
 
     with open(output_json, "w") as fh:
         json.dump(results, fh, indent=2)
-    print(f"[fle.rl.eval] wrote results to {output_json}")
+    print(f"[fle.rl.eval_lstm] wrote results to {output_json}")
 
     env.close()
     return results
@@ -232,9 +237,7 @@ def evaluate(cfg: EvalConfig) -> dict:
 
 def _print_summary(r: dict) -> None:
     sep = "─" * 60
-    print(f"\n{sep}")
-    print("  EVALUATION SUMMARY")
-    print(sep)
+    print(f"\n{sep}\n  EVALUATION SUMMARY (LSTM)\n{sep}")
     print(f"  end reason     : {r['end_reason']}  "
           f"(terminated={r['terminated']} truncated={r['truncated']})")
     print(f"  survival ticks : {r['survival_ticks']:,}  ({r['survival_ticks'] / 60.0:.1f}s game time)")
@@ -249,40 +252,30 @@ def _print_summary(r: dict) -> None:
     ac = r["action_counts"]
     print(f"  actions        : noop={ac['noop']}  pick={ac['pick']}  place={ac['place']}  "
           f"refill={ac['refill']}  move={ac['move']}  take_ammo={ac['take_ammo']}")
-    print(f"  wall time      : {r['wall_time_s']:.1f}s")
-    print(sep)
+    print(f"  wall time      : {r['wall_time_s']:.1f}s\n{sep}")
 
 
-def _parse_args(argv=None) -> EvalConfig:
+def _parse_args(argv=None) -> RecurrentEvalConfig:
     p = argparse.ArgumentParser(
-        description="Evaluate a trained Tower Defense RL model on one episode (no training)"
+        description="Evaluate a trained Tower Defense masked PPO-LSTM model (no training)"
     )
-    p.add_argument("--model", required=True, help="Path to a saved model .zip "
-                   "(final_model / best / checkpoint)")
-    p.add_argument("--difficulty", choices=["easy", "medium", "hard"], default="medium",
-                   help="Scenario preset; should match the training run")
-    p.add_argument("--evolution-factor", type=float, default=None,
-                   help="Enemy evolution factor 0..1 (default: keep the save's value)")
-    p.add_argument("--group-size", type=int, default=None,
-                   help="Max biters per attack group (default: engine default)")
+    p.add_argument("--model", required=True, help="Path to a saved .pt checkpoint")
+    p.add_argument("--evolution-factor", type=float, default=None)
+    p.add_argument("--group-size", type=int, default=None)
     p.add_argument("--save-path", default=None)
-    p.add_argument("--run-idx", type=int, default=0, help="Which container to connect to")
-    p.add_argument("--game-speed", type=float, default=None,
-                   help="Override scenario game speed (e.g. 1.0 to watch, 10.0 = training speed)")
+    p.add_argument("--run-idx", type=int, default=0)
+    p.add_argument("--game-speed", type=float, default=None)
     p.add_argument("--no-deterministic", action="store_true",
                    help="Sample from the policy instead of taking the argmax action")
-    p.add_argument("--max-steps", type=int, default=100_000,
-                   help="Safety cap on steps before forcing the episode to end")
+    p.add_argument("--max-steps", type=int, default=100_000)
     p.add_argument("--device", default="auto", help="auto | cpu | cuda")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-dir", default="./td_runs")
     p.add_argument("--run-name", default=None)
-    p.add_argument("--output-json", default=None,
-                   help="Explicit path for the results JSON (default <run_dir>/eval_results.json)")
+    p.add_argument("--output-json", default=None)
     a = p.parse_args(argv)
-    return EvalConfig(
+    return RecurrentEvalConfig(
         model_path=a.model,
-        difficulty=a.difficulty,
         evolution_factor=a.evolution_factor,
         max_unit_group_size=a.group_size,
         save_path=a.save_path,
@@ -309,7 +302,6 @@ def main(argv=None):
     logging.getLogger("fle.env.gym_env.td_environment").setLevel(logging.INFO)
     for noisy in ("urllib3", "requests", "docker", "stable_baselines3", "factorio_rcon"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-
     evaluate(_parse_args(argv))
 
 

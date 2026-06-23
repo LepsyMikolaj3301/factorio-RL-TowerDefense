@@ -39,8 +39,6 @@ class FactorioMCPState:
 
         try:
             env_ids = list_available_environments()
-            # print(f"DEBUG: Available environment IDs: {env_ids}")
-            # print(f"DEBUG: Number of environments found: {len(env_ids)}")
 
             if not env_ids:
                 raise Exception("No environments found")
@@ -52,7 +50,6 @@ class FactorioMCPState:
                     self.gym_env.reset()
                     return
 
-            # print(f"DEBUG: No open environment found, using first available: {env_ids[0]}")
             self.gym_env = gym.make(env_ids[0], run_idx=0)
 
         except IndexError as e:
@@ -126,7 +123,6 @@ class FactorioMCPState:
         """Scan for running Factorio servers"""
         try:
             ips, udp_ports, tcp_ports = get_local_container_ips()
-            # print("scanning for servers")
             # Create server objects for each detected instance
             new_servers = {}
             for i in range(len(ips)):
@@ -173,7 +169,6 @@ class FactorioMCPState:
                     except Exception as e:
                         server.is_active = False
                         server.system_response = str(e)
-                        # print(e)
 
                     new_servers[instance_id] = server
 

@@ -24,7 +24,6 @@ class LuaScriptManager:
         self.cache_scripts = cache_scripts
         if not cache_scripts:
             self._clear_game_checksums(rcon_client)
-        # self.action_directory = _get_action_dir()
 
         self.lib_directory = _get_mods_dir()
         if cache_scripts:

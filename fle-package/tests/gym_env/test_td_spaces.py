@@ -8,6 +8,8 @@ from fle.env.gym_env.td_spaces import (
     ACTION_PLACE_TURRET,
     ACTION_REFILL_TURRET,
     ACTION_MOVE_ANCHOR,
+    ACTION_TAKE_AMMO,
+    AMMO_AMOUNT_LEVELS,
     NUM_ACTION_TYPES,
     NUM_CHANNELS,
     DEFAULT_GRID_SIZE,
@@ -37,6 +39,7 @@ class TestTDSpaces:
             ACTION_PLACE_TURRET,
             ACTION_REFILL_TURRET,
             ACTION_MOVE_ANCHOR,
+            ACTION_TAKE_AMMO,
         ]
         assert len(actions) == NUM_ACTION_TYPES
         assert len(set(actions)) == NUM_ACTION_TYPES
@@ -47,7 +50,8 @@ class TestTDSpaces:
         assert ACTION_PLACE_TURRET == 2
         assert ACTION_REFILL_TURRET == 3
         assert ACTION_MOVE_ANCHOR == 4
-        assert NUM_ACTION_TYPES == 5
+        assert ACTION_TAKE_AMMO == 5
+        assert NUM_ACTION_TYPES == 6
 
     def test_observation_space_shape(self):
         obs_space = make_observation_space()
@@ -63,6 +67,7 @@ class TestTDSpaces:
         assert obs_space["slot_valid_mask"].shape == (MAX_SLOTS,)
         assert obs_space["place_slot_mask"].shape == (MAX_SLOTS,)
         assert obs_space["refill_slot_mask"].shape == (MAX_SLOTS,)
+        assert obs_space["take_ammo_slot_mask"].shape == (MAX_SLOTS,)
         # Old free-placement fields are gone.
         assert "turrets" not in obs_space.spaces
         assert "walls" not in obs_space.spaces
@@ -78,7 +83,12 @@ class TestTDSpaces:
         assert obs_space["movement"].shape == (MOVEMENT_FEATURES,)
         assert obs_space["recent_losses"].shape == (RECENT_LOSS_FEATURES,)
         # Action-conditioned reach masks for the pointer head.
-        for k in ("place_reach_mask", "refill_reach_mask", "pick_reach_mask"):
+        for k in (
+            "place_reach_mask",
+            "refill_reach_mask",
+            "pick_reach_mask",
+            "take_ammo_reach_mask",
+        ):
             assert obs_space[k].shape == (MAX_SLOTS,)
 
     def test_observation_space_contains_sample(self):
@@ -109,7 +119,12 @@ class TestTDSpaces:
 
     def test_flatten_action_space_layout(self):
         flat = flatten_action_space()
-        assert list(flat.nvec) == [NUM_ACTION_TYPES, MAX_SLOTS, 51, MAX_ANCHORS]
+        assert list(flat.nvec) == [
+            NUM_ACTION_TYPES,
+            MAX_SLOTS,
+            AMMO_AMOUNT_LEVELS,
+            MAX_ANCHORS,
+        ]
 
     def test_tracked_items_not_empty(self):
         assert "firearm-magazine" in TRACKED_ITEMS

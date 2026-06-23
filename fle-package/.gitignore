@@ -1,11 +1,7 @@
-# Python/venv
+# Python
 .venv/
 .env
 .fle/
-api_keys.json
-**/.claude/settings.local.json
-
-# Python cache
 __pycache__/
 *.pyc
 uv.lock
@@ -19,11 +15,13 @@ uv.lock
 /dist/
 /build/
 *.egg-info/
+/td_runs/
+/td_runs_OLD/
 
 # Docker
 **/docker-compose.yml
 
-# Misc
+# Local output
 trajectory_logs/
 wandb/
 summary_cache/
@@ -31,14 +29,12 @@ summary_cache/
 *.mp4
 *.jsonl
 *.db
-CLAUDE.md
 
 # API
 api_keys.json
 /log/
 *.log
 *.trace
-*.jsonl
 
 # Database
 .fle/
@@ -46,16 +42,9 @@ api_keys.json
 # Tower-defense predefined save files (heavy binaries — never commit)
 /data/saves/*.zip
 
-.env
 .ipynb_checkpoints/
-*.db
 
-# Experiment tracking
-wandb/
-summary_cache/
-
-# Jack's stuff.
-/docker-compose.yml
+# Local development artifacts
 /data/plans/factorio_guides/
 /docs/assets/videos/
 /fle/agents/data/blueprints_to_policies/blueprints/
@@ -71,16 +60,9 @@ summary_cache/
 /data/vqa/dataset/images/
 /data/vqa/tasks/basic/logs/
 /data/vqa/tasks/contrastive_alignment/logs/
-/data/vqa/tasks/contrastive_alignment/logs/
-/data/logs/
 /data/logs/
 /.factorio_mcp_repo/
 /.claude-code/
-/claude-code.zip
-
-# Claude Code
-/.claude-code/
-/.factorio_mcp_repo/
 /claude-code.zip
 
 # Misc

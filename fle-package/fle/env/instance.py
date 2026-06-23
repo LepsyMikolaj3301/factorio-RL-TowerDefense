@@ -228,9 +228,7 @@ class FactorioInstance:
         self.initial_score = 0
         try:
             self.first_namespace.score()
-            # print("Initial score:", self.initial_score)
         except Exception:
-            # print(e)
             # Invalidate cache if there is an error
             self.lua_script_manager = LuaScriptManager(self.rcon_client, False)
             self.script_dict = {
@@ -375,10 +373,6 @@ class FactorioInstance:
         try:
             rcon_client.connect()
             rcon_client.send_command("/sc rcon.print(#game.players)")
-            # if int(player_count) == 0:
-            #     print(
-            #         "WARNING: LuaPlayer hasn't been initialised into the game. Entity placement behavior _may_ be incorrect for boilers and pumps."
-            #     )
 
         except Exception as e:
             raise ConnectionError(
@@ -495,7 +489,6 @@ class FactorioInstance:
         lua_response = self.rcon_client.send_command(
             f"/sc rcon.print(dump(storage.get_alerts({seconds})))"
         )
-        # print(lua_response)
         alert_dict, duration = _lua2python("alerts", lua_response, start=start)
         if isinstance(alert_dict, dict):
             alerts = list(alert_dict.values())

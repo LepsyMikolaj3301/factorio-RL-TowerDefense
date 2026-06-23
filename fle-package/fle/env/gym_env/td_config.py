@@ -78,10 +78,8 @@ class TDScenarioConfig:
     # (0,0) by convention; (0,10) keeps the agent inside the walled ring but
     # off the radar tile.
     player_spawn_position: Tuple[float, float] = (0.0, 10.0)
-    # When False, _spawn_wave() is a no-op — biters originate from the map's
-    # own Factorio AI (unit-spawners baked into the predefined save). This is
-    # the correct mode for the predefined-save workflow; True would require
-    # biter_director which is not used here.
+    # Runtime wave spawning is disabled for predefined TD saves; attacks come
+    # from the map's own unit-spawners.
     spawn_waves_at_runtime: bool = False
     # When True, waves are sent from the map's baked-in unit-spawners (enemy
     # force). Falls back to the geometric-ring origin if no spawners exist.
@@ -125,10 +123,11 @@ class TDScenarioConfig:
     delta_damage: float = 0.5        # per HP of character damage taken
     epsilon_invalid: float = 0.5     # per invalid action
     # Destruction penalties (per entity lost to the enemy this step).
-    p_wall_destroyed: float = 5.0          # strong
+    p_wall_destroyed: float = 12.0         # strong; biters destroy walls in packs
     p_turret_destroyed: float = 20.0       # very strong (turret permanently lost)
     p_building_destroyed: float = 20.0     # very strong
     p_radar_damage: float = 0.2            # per HP the radar (the "heart") loses
+    p_empty_turret: float = 0.05           # per occupied turret with no usable ammo
     p_move_command: float = 0.25            # per valid MOVE_ANCHOR command
     p_move_transit: float = 0.05            # per step spent walking/in transit
     terminal_bonus: float = 100.0          # survived to max_ticks
@@ -139,6 +138,12 @@ class TDScenarioConfig:
     w_ammo: float = 0.0        # legacy absolute ammo shaping (kept disabled)
     w_coverage_delta: float = 0.5  # reward when filled slot coverage improves
     w_ammo_delta: float = 0.2      # reward when loaded-turret fraction improves
+    # Reward when armed turret coverage improves on the side where live threats
+    # or, before contact, visible nests indicate the next attack is likely from.
+    w_threatened_turret_delta: float = 0.75
+    w_early_place_turret: float = 0.10
+    w_early_refill_turret: float = 0.20
+    early_turret_setup_steps: int = 200
     w_threat: float = 0.05     # penalty scaling with closeness of the nearest swarm
     shaping_decay_steps: int = 200_000
 

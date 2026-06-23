@@ -22,43 +22,8 @@ class LegendRenderer:
         """Initialize the legend renderer with required components"""
         self.config = config
         self.color_manager = color_manager
-        self.categorizer = categorizer  # Make sure this is stored
+        self.categorizer = categorizer
         self.shape_renderer = shape_renderer
-
-    # def get_entities_by_category(self) -> Dict[str, List[Tuple[str, int]]]:
-    #     """Group entity types by their categories with counts and collect shape information"""
-    #     entities_by_category = defaultdict(list)
-    #
-    #     # Track entity shapes for use in the legend
-    #     entity_shapes = {}
-    #
-    #     # Find the category for each entity type and group them
-    #     for entity_name in self.entity_type_counts:
-    #         # For resource categories, map them directly to their specific categories
-    #         if entity_name in ["iron-ore", "copper-ore", "coal", "stone", "uranium-ore", "crude-oil"]:
-    #             category = entity_name
-    #         elif entity_name == "water":
-    #             category = "water"
-    #         else:
-    #             # For regular entities, get their actual category
-    #             category = self.categorizer.get_entity_category(entity_name)
-    #
-    #         # Get the shape for this entity type
-    #         shape_type = self.config.get_category_shape(category)
-    #         entity_shapes[entity_name] = shape_type
-    #
-    #         entities_by_category[category].append(
-    #             (entity_name, self.entity_type_counts[entity_name], shape_type)
-    #         )
-    #
-    #     # Sort entities within each category by count (descending)
-    #     for category in entities_by_category:
-    #         entities_by_category[category] = sorted(
-    #             entities_by_category[category],
-    #             key=lambda x: (-x[1], x[0])  # Sort by count (descending), then name
-    #         )
-    #
-    #     return dict(entities_by_category), entity_shapes
 
     def calculate_legend_dimensions(
         self,
