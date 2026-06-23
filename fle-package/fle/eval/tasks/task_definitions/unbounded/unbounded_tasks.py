@@ -18,6 +18,10 @@ from typing import Literal, Dict, Any, Union
 from fle.env.game_types import Prototype
 
 
+def _model_dump(model: BaseModel) -> Dict[str, Any]:
+    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+
+
 def _load_prompt(filename: str) -> str:
     """Load a prompt template from a .jinja2.md file in the same directory."""
     prompt_path = Path(__file__).parent / filename
@@ -54,7 +58,7 @@ class UnboundedThroughputTaskConfig(BaseModel):
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for compatibility with existing code."""
-        data = self.dict()
+        data = _model_dump(self)
         # Convert Prototype to string if necessary
         if isinstance(self.throughput_entity, Prototype):
             data["throughput_entity"] = self.throughput_entity.value
@@ -80,7 +84,7 @@ class DefaultTaskConfig(BaseModel):
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for compatibility with existing code."""
-        return self.dict()
+        return _model_dump(self)
 
 
 class UnboundedProductionTaskConfig(BaseModel):
@@ -111,7 +115,7 @@ class UnboundedProductionTaskConfig(BaseModel):
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for compatibility with existing code."""
-        return self.dict()
+        return _model_dump(self)
 
 
 # Define unbounded throughput tasks

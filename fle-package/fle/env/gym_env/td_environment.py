@@ -18,11 +18,15 @@ from fle.env.gym_env.td_spaces import (
     ACTION_PICK_TURRET,
     ACTION_PLACE_TURRET,
     ACTION_REFILL_TURRET,
+    BOILER_FEATURES,
+    BOILER_HP_NORM,
     CHAR_HP_NORM,
     COUNT_NORM,
     ETA_NORM,
     GROUP_FEATURES,
+    LOSS_COUNT_NORM,
     MAX_ANCHORS,
+    MAX_BOILERS,
     MAX_GROUPS,
     MAX_NESTS,
     MAX_SLOTS,
@@ -43,6 +47,16 @@ from fle.env.game_types import Prototype
 from fle.env.entities import Direction, Position
 
 logger = logging.getLogger(__name__)
+
+# RCON network errors (socket dropped / not connected). Factorio closes the
+# RCON socket when a human client joins to spectate, and a server crash+restart
+# also surfaces here. We catch the common base so step()/reset() can reconnect
+# instead of killing the training run. Fall back to Exception if the lib layout
+# changes.
+try:
+    from factorio_rcon.factorio_rcon import RCONNetworkError as _RCONNetworkError
+except ImportError:  # pragma: no cover
+    _RCONNetworkError = Exception
 
 
 class TowerDefenseEnv(gymnasium.Env):
@@ -87,6 +101,7 @@ class TowerDefenseEnv(gymnasium.Env):
         self.game_speed = cfg.game_speed
         self.max_slots = min(cfg.max_turret_slots, MAX_SLOTS)
         self.max_anchors = min(cfg.max_anchor_slots, MAX_ANCHORS)
+        self.max_boilers = min(cfg.max_boiler_slots, MAX_BOILERS)
 
         # Distance (tiles) within which a live turret is considered to occupy a
         # slot, or two read positions are considered the same slot.
@@ -109,9 +124,19 @@ class TowerDefenseEnv(gymnasium.Env):
         # Position normalizer (radar-relative coords are divided by this).
         self._norm = max(1.0, self._radius)
 
-        # Async-movement state (set by _move_to_anchor, polled in step()).
+        # Async-movement state (set by _move_to_anchor, advanced in step()).
+        # The loaded predefined save's control.lua has no on_tick walker, so the
+        # env drives movement itself: it glides the character along _walk_path by
+        # (decision_cadence * walk_speed) tiles each step, during the unpaused
+        # window, so travel costs real game-time and biters attack mid-transit.
         self._moving = False
         self._move_target = -1
+        self._walk_path: list = []   # list of (x, y) world waypoints
+        self._walk_idx = 0           # index of the next waypoint to reach
+
+        # Last good observation, returned if RCON drops mid-step so the episode
+        # can terminate with a valid (if stale) obs instead of crashing.
+        self._last_obs: Optional[Dict[str, np.ndarray]] = None
 
         # Raw (un-normalized) values stashed during _get_observation so the
         # reward/termination logic doesn't re-query the game.
@@ -120,11 +145,19 @@ class TowerDefenseEnv(gymnasium.Env):
         self._cur_coverage = 0.0       # filled_reachable / total_reachable
         self._cur_ammo_frac = 0.0      # loaded_turrets / live_turrets
         self._cur_threat_closeness = 0.0  # 0 (far) .. 1 (on top of base)
-        self._last_events: Dict[str, int] = {}
+        self._last_events: Dict[str, int] = self._zero_events()
+        self._episode_events: Dict[str, int] = self._zero_events()
+        self._prev_coverage = 0.0
+        self._prev_ammo_frac = 0.0
 
         # Canonical turret slots, read once from the map on first reset.
         # Shape (N, 2): the (x, y) center of every slot. Never changes for a run.
         self._turret_slots: Optional[np.ndarray] = None
+
+        # Canonical boiler positions, read once from the map on first reset.
+        # Shape (N, 2). If one third of this initial set is destroyed, the
+        # episode terminates and training resets from the snapshot.
+        self._boiler_slots: Optional[np.ndarray] = None
 
         # Anchor tiles, read once from the map on first reset. Shape (N, 2): the
         # (x, y) center of every `hazard-concrete-left` tile. These are the only
@@ -152,6 +185,19 @@ class TowerDefenseEnv(gymnasium.Env):
         # list of (name, x, y). Used to rebuild nests on every reset.
         self._starting_nests: Optional[list] = None
 
+        # Infinity chest settings are Factorio-specific entity state. Keep a
+        # Python-side copy so episode resets can repair filters even if the
+        # generic snapshot loader drops them.
+        self._infinity_chest_settings: Optional[list] = None
+
+        # Resolve the configured ammo name to a Prototype once. Used by the
+        # REFILL action so it inserts the same magazine the agent actually
+        # carries (see TDScenarioConfig.ammo_type).
+        self._ammo_prototype = next(
+            (p for p in Prototype if p.value[0] == self.config.ammo_type),
+            Prototype.FirearmMagazine,
+        )
+
     def reset(
         self,
         *,
@@ -159,15 +205,21 @@ class TowerDefenseEnv(gymnasium.Env):
         options: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         super().reset(seed=seed)
+        t_reset = _time_module.perf_counter()
 
         if self._initial_snapshot is None:
+            logger.info("reset() — FIRST RESET: reading map entities and capturing snapshot")
             # First reset: server already loaded the save file.
             # Configure the running game, then capture the snapshot.
             self.instance.set_speed(self.game_speed)
             self.instance.pause()
             self.instance._reset_elapsed_ticks()
+            self._reset_td_lua_storage()
+            if self.config.disable_enemy_expansion:
+                self._disable_enemy_expansion()
 
             self._read_radar()
+            self._read_boiler_slots()
             # Record the pristine nest layout before any episode mutates it.
             self._record_starting_nests()
             self._spawn_player()
@@ -190,14 +242,25 @@ class TowerDefenseEnv(gymnasium.Env):
             # Precompute which anchors can reach which slots. Static for the run.
             self._build_anchor_reach_matrix()
 
+            # Print a one-time human-readable save validation report.
+            self._report_save_state()
+
             # Capture the snapshot with ALL slot turrets present, so each episode
             # restores the full set before re-rolling which slots start empty.
+            self._record_infinity_chest_settings()
             self._capture_save_state()
 
         else:
+            logger.info("reset() — EPISODE RESET #%d: restoring from snapshot", self._step_count)
             # Subsequent resets: wipe and restore from snapshot.
+            t_snap = _time_module.perf_counter()
             self.instance.reset(game_state=self._initial_snapshot)
-            self._restore_evolution_factor()
+            logger.debug("reset() — snapshot restore took %.3fs", _time_module.perf_counter() - t_snap)
+            # GameState captures entities/research/inventories but not the Lua
+            # storage global. Reset TD-specific fields explicitly so walk state,
+            # event counters, and threat cache don't bleed across episodes —
+            # matching the clean state of a freshly-loaded save.
+            self._reset_td_lua_storage()
             self.instance.set_speed(self.game_speed)
             self.instance.pause()
             self.instance._reset_elapsed_ticks()
@@ -209,6 +272,14 @@ class TowerDefenseEnv(gymnasium.Env):
             if self.config.restore_starting_nests_on_reset:
                 self._restore_starting_nests()
 
+            self._restore_infinity_chest_settings()
+            self._assert_snapshot_restored()
+
+        # Apply difficulty knobs (evolution factor + biter group size). On the
+        # first reset this initializes the world; on later resets it re-applies
+        # the settings a snapshot restore would otherwise revert.
+        self._apply_difficulty_settings()
+
         # Re-roll which slots start empty for this episode (seeded by reset seed).
         self._delete_turret_subset()
 
@@ -217,14 +288,24 @@ class TowerDefenseEnv(gymnasium.Env):
         self._prev_health = self._get_character_health()
         self._prev_radar_hp = self._get_radar_hp()
         self._wave_number = 0
-        self._current_anchor_index = 0
+        self._current_anchor_index = self._nearest_anchor_index()
         self._moving = False
         self._move_target = -1
         # Flush any death events accumulated outside an episode so the first
         # step's reward only reflects in-episode deaths.
         self._read_events()
+        self._last_events = self._zero_events()
+        self._episode_events = self._zero_events()
 
         obs = self._get_observation()
+        self._prev_coverage = self._cur_coverage
+        self._prev_ammo_frac = self._cur_ammo_frac
+        logger.info("reset() — done in %.2fs  slots=%d  anchors=%d  "
+                    "char_hp=%.0f  radar_hp=%.0f",
+                    _time_module.perf_counter() - t_reset,
+                    0 if self._turret_slots is None else len(self._turret_slots),
+                    0 if self._anchor_slots is None else len(self._anchor_slots),
+                    self._cur_char_hp, self._cur_radar_hp)
         info = {"step": 0, "elapsed_ticks": 0, "wave": 0}
         return obs, info
 
@@ -238,9 +319,231 @@ class TowerDefenseEnv(gymnasium.Env):
         except (ValueError, AttributeError):
             self._initial_evolution_factor = 0.0
 
-    def _restore_evolution_factor(self) -> None:
+    def _apply_difficulty_settings(self) -> None:
+        """Apply the scenario's difficulty knobs to the live game.
+
+        Evolution factor is enemy-force state that GameState restores from the
+        snapshot, so it must be re-applied every reset. Group size is a
+        map_setting that persists across snapshot restores, but we set it each
+        reset too so the world always matches the config. Both knobs default to
+        None, in which case the save's own values are preserved (evolution is
+        restored to the factor captured on the first reset; group size is left
+        at the engine/map default).
+        """
+        evo = self.config.evolution_factor
+        if evo is None:
+            evo = self._initial_evolution_factor
         self.instance.rcon_client.send_command(
-            f"/sc game.forces['enemy'].set_evolution_factor(game.surfaces[1], {self._initial_evolution_factor})"
+            f"/sc game.forces['enemy'].set_evolution_factor(game.surfaces[1], {float(evo)})"
+        )
+        group_size = self.config.max_unit_group_size
+        if group_size is not None:
+            self.instance.rcon_client.send_command(
+                f"/sc game.map_settings.unit_group.max_unit_group_size = {int(group_size)}"
+            )
+
+    def _assert_snapshot_restored(self) -> None:
+        """Fail fast if GameState restore did not recreate core TD entities."""
+        try:
+            raw = self.instance.rcon_client.send_command(
+                "/sc local s=game.surfaces[1] "
+                "local r=#s.find_entities_filtered{name='radar'} "
+                "local t=#s.find_entities_filtered{name='gun-turret'} "
+                "rcon.print(r..','..t)"
+            ).strip()
+            radar_count, turret_count = [int(float(x)) for x in raw.split(",", 1)]
+        except Exception as e:
+            raise RuntimeError(f"Could not validate TD snapshot restore: {e}") from e
+
+        if radar_count <= 0 or turret_count <= 0:
+            raise RuntimeError(
+                "TD snapshot restore failed: "
+                f"radars={radar_count}, gun_turrets={turret_count}. "
+                "The entity-state loader did not recreate the saved map."
+            )
+
+        if self._infinity_chest_settings:
+            try:
+                raw = self.instance.rcon_client.send_command(
+                    "/sc local n=0 "
+                    "for _,e in pairs(game.surfaces[1].find_entities_filtered{name='infinity-chest'}) do "
+                    "local ok,filters=pcall(function() return e.infinity_container_filters end) "
+                    "if (not ok) or (not filters) then "
+                    "ok,filters=pcall(function() return e.infinity_container_filter end) "
+                    "end "
+                    "if ok and filters then "
+                    "if filters.name then filters={filters} end "
+                    "for _,f in pairs(filters) do if f and f.name then n=n+1 end end "
+                    "end "
+                    "end "
+                    "rcon.print(n)"
+                ).strip()
+                filter_count = int(float(raw or 0))
+            except Exception as e:
+                raise RuntimeError(f"Could not validate infinity-chest filters: {e}") from e
+            if filter_count <= 0:
+                raise RuntimeError(
+                    "TD snapshot restore failed: infinity-chest filters were not restored."
+                )
+
+    @staticmethod
+    def _lua_string(value: Any) -> str:
+        text = str(value)
+        text = text.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{text}"'
+
+    @staticmethod
+    def _lua_bool(value: Any) -> str:
+        return "true" if bool(value) else "false"
+
+    def _record_infinity_chest_settings(self) -> None:
+        """Capture infinity-chest filter settings from the pristine TD save."""
+        raw = self.instance.rcon_client.send_command(
+            "/sc local out={} "
+            "for _,e in pairs(game.surfaces[1].find_entities_filtered{name='infinity-chest'}) do "
+            "local remove=false "
+            "local ok_remove,value=pcall(function() return e.remove_unfiltered_items end) "
+            "if ok_remove and value ~= nil then remove=value end "
+            "local filters={} "
+            "local ok,fs=pcall(function() return e.infinity_container_filters end) "
+            "if (not ok) or (not fs) then "
+            "ok,fs=pcall(function() return e.infinity_container_filter end) "
+            "end "
+            "if ok and fs then "
+            "if fs.name then fs={fs} end "
+            "for idx,f in pairs(fs) do "
+            "if f and f.name then "
+            "table.insert(filters, tostring(f.index or idx or #filters+1)..':'.."
+            "tostring(f.name)..':'..tostring(f.count or 0)..':'.."
+            "tostring(f.mode or 'at-least')) "
+            "end "
+            "end "
+            "end "
+            "table.insert(out, tostring(e.position.x)..','..tostring(e.position.y)..','.."
+            "tostring(remove)..','..table.concat(filters,'|')) "
+            "end "
+            "rcon.print(table.concat(out,';'))"
+        ).strip()
+
+        settings = []
+        if raw:
+            for chest_blob in raw.split(";"):
+                if not chest_blob:
+                    continue
+                chest_parts = chest_blob.split(",", 3)
+                while len(chest_parts) < 4:
+                    chest_parts.append("")
+                x_str, y_str, remove_str, filter_str = chest_parts[:4]
+                filters = []
+                for filter_blob in filter(None, filter_str.split("|")):
+                    parts = filter_blob.split(":", 3)
+                    if len(parts) != 4:
+                        continue
+                    index_str, name, count_str, mode = parts
+                    try:
+                        index = int(float(index_str))
+                    except ValueError:
+                        index = len(filters) + 1
+                    try:
+                        count = int(float(count_str))
+                    except ValueError:
+                        count = 0
+                    if name:
+                        filters.append({
+                            "index": index,
+                            "name": name,
+                            "count": count,
+                            "mode": mode or "at-least",
+                        })
+                try:
+                    settings.append({
+                        "x": float(x_str),
+                        "y": float(y_str),
+                        "remove_unfiltered_items": remove_str == "true",
+                        "filters": filters,
+                    })
+                except ValueError:
+                    continue
+        self._infinity_chest_settings = settings
+
+    def _restore_infinity_chest_settings(self) -> None:
+        """Reapply recorded infinity-chest filter settings after snapshot reset."""
+        if not self._infinity_chest_settings:
+            return
+
+        entries = []
+        for chest in self._infinity_chest_settings:
+            filters = []
+            for filter_data in chest.get("filters", []):
+                filters.append(
+                    "{index=%d,name=%s,count=%d,mode=%s}" % (
+                        int(filter_data["index"]),
+                        self._lua_string(filter_data["name"]),
+                        int(filter_data["count"]),
+                        self._lua_string(filter_data["mode"]),
+                    )
+                )
+            entries.append(
+                "{x=%.6f,y=%.6f,remove=%s,filters={%s}}" % (
+                    float(chest["x"]),
+                    float(chest["y"]),
+                    self._lua_bool(chest.get("remove_unfiltered_items", False)),
+                    ",".join(filters),
+                )
+            )
+
+        self.instance.rcon_client.send_command(
+            "/sc local entries={%s} local s=game.surfaces[1] "
+            "for _,entry in ipairs(entries) do "
+            "local e=s.find_entities_filtered{name='infinity-chest', position={entry.x,entry.y}, radius=0.7}[1] "
+            "if e then "
+            "pcall(function() e.remove_unfiltered_items=entry.remove end) "
+            "local sparse={} local packed={} local slot={} "
+            "for _,f in ipairs(entry.filters) do "
+            "local with_index={index=f.index,name=f.name,count=f.count,mode=f.mode} "
+            "local no_index={name=f.name,count=f.count,mode=f.mode} "
+            "sparse[f.index]=with_index table.insert(packed,with_index) slot[f.index]=no_index "
+            "end "
+            "pcall(function() e.infinity_container_filters=sparse end) "
+            "pcall(function() e.infinity_container_filters=packed end) "
+            "for index,filter in pairs(sparse) do "
+            "pcall(function() e.set_infinity_container_filter(index,filter) end) "
+            "if slot[index] then pcall(function() e.set_infinity_container_filter(index,slot[index]) end) end "
+            "end "
+            "if packed[1] then pcall(function() e.infinity_container_filter=packed[1] end) end "
+            "if slot[1] then pcall(function() e.infinity_container_filter=slot[1] end) end "
+            "end "
+            "end" % ",".join(entries)
+        )
+
+    def _reset_td_lua_storage(self) -> None:
+        """Reset the TD-specific Lua storage fields to their save-load initial values.
+
+        GameState snapshots capture entities/research/inventories but not the
+        Lua `storage` global. These fields must be explicitly wiped each episode
+        so walk state, event counters, and threat cache don't carry over from
+        the previous episode (matching a freshly-loaded save as used in tests).
+        """
+        self.instance.rcon_client.send_command(
+            "/sc "
+            "storage.td_walk = {active=false, path={}, idx=1, player_index=1, target_anchor=-1, speed=0.2}; "
+            "storage.td_events = {kills=0, turrets_lost=0, walls_lost=0, "
+            "buildings_lost=0, boilers_lost=0, radar_lost=0, char_died=0, "
+            "wall_n=0, wall_e=0, wall_s=0, wall_w=0, "
+            "turret_n=0, turret_e=0, turret_s=0, turret_w=0}; "
+            "storage.td_threat_prev = {tick=0, groups={}}"
+        )
+
+    def _disable_enemy_expansion(self) -> None:
+        """Stop biters creating new nests beyond the ones baked into the save.
+
+        The scenario control.lua sets this in on_init, but on_init never runs
+        when a save is loaded, so the loaded map keeps expansion enabled. We
+        enforce it here; map_settings persist across snapshot restores, so doing
+        it once on the first reset is enough to keep the nest count stable.
+        """
+        self.instance.rcon_client.send_command(
+            "/sc game.map_settings.enemy_expansion.enabled = false"
         )
 
     def _read_radar(self) -> None:
@@ -282,6 +585,78 @@ class TowerDefenseEnv(gymnasium.Env):
             "No radar found on map within 128 tiles of (0,0). "
             "The env will not terminate on radar destruction."
         )
+
+    def _read_boiler_slots(self) -> None:
+        """Read initial boiler positions from the map into the canonical list."""
+        r = float(self.config.boiler_scan_radius)
+        cx, cy = self._center_x, self._center_y
+        boilers: list = []
+        try:
+            raw = self.instance.rcon_client.send_command(
+                f"/sc local out={{}} "
+                f"for _,e in pairs(game.surfaces[1].find_entities_filtered{{"
+                f"name='boiler', area={{{{{cx-r},{cy-r}}},{{{cx+r},{cy+r}}}}}"
+                f"}}) do "
+                f"out[#out+1]=e.position.x..','..e.position.y end "
+                f"rcon.print(table.concat(out,';'))"
+            ).strip()
+            if raw:
+                for pair in raw.split(";"):
+                    if not pair:
+                        continue
+                    x, y = pair.split(",", 1)
+                    boilers.append((float(x), float(y)))
+                    if len(boilers) >= self.max_boilers:
+                        break
+        except Exception as e:
+            logger.warning(f"Failed to read boiler positions: {e}")
+        self._boiler_slots = np.array(boilers, dtype=np.float32).reshape(-1, 2)
+        if len(boilers) == 0:
+            logger.warning(
+                "No boilers found near the radar; boiler-loss termination is disabled."
+            )
+
+    def _current_boilers(self) -> list:
+        """Return live boilers near the radar as (x, y, health)."""
+        r = float(self.config.boiler_scan_radius)
+        cx, cy = self._center_x, self._center_y
+        try:
+            raw = self.instance.rcon_client.send_command(
+                f"/sc local out={{}} "
+                f"for _,e in pairs(game.surfaces[1].find_entities_filtered{{"
+                f"name='boiler', area={{{{{cx-r},{cy-r}}},{{{cx+r},{cy+r}}}}}"
+                f"}}) do "
+                f"out[#out+1]=e.position.x..','..e.position.y..','..(e.health or 0) end "
+                f"rcon.print(table.concat(out,';'))"
+            ).strip()
+        except Exception:
+            return []
+        boilers = []
+        if raw:
+            for part in raw.split(";"):
+                if not part:
+                    continue
+                try:
+                    x, y, hp = part.split(",")
+                    boilers.append((float(x), float(y), float(hp)))
+                except ValueError:
+                    continue
+        return boilers
+
+    def _boiler_status(self, boilers: list) -> Tuple[np.ndarray, np.ndarray]:
+        """Match canonical boiler slots against live boilers."""
+        n = 0 if self._boiler_slots is None else len(self._boiler_slots)
+        alive = np.zeros(n, dtype=bool)
+        health = np.zeros(n, dtype=np.float32)
+        eps = self._slot_epsilon
+        for i in range(n):
+            sx, sy = self._boiler_slots[i]
+            for (bx, by, hp) in boilers:
+                if abs(bx - sx) <= eps and abs(by - sy) <= eps:
+                    alive[i] = True
+                    health[i] = hp
+                    break
+        return alive, health
 
     def _spawn_player(self) -> None:
         """Teleport the agent character to the configured spawn position."""
@@ -357,26 +732,43 @@ class TowerDefenseEnv(gymnasium.Env):
     # Turret slot management
     # ------------------------------------------------------------------
     def _current_turrets(self) -> list:
-        """Return current gun-turrets as a list of (x, y, ammo, health)."""
-        ns = self.instance.first_namespace
-        turrets = []
+        """Return current gun-turrets as a list of (x, y, ammo, health).
+
+        Uses a direct RCON query filtered to gun-turrets only so that walls,
+        infinity-pipes, chests, and other map entities are never serialised over
+        RCON (doing a broad get_entities on a map with 500+ walls hangs the step).
+        """
+        cx, cy, r = self._center_x, self._center_y, self._radius
+        t0 = _time_module.perf_counter()
         try:
-            entities = ns.get_entities(
-                position=Position(x=self._center_x, y=self._center_y),
-                radius=self._radius,
-            )
-            for e in entities:
-                if e.name == "gun-turret":
-                    turrets.append(
-                        (
-                            float(e.position.x),
-                            float(e.position.y),
-                            float(getattr(e, "ammo_count", 0) or 0),
-                            float(getattr(e, "health", 0) or 0),
-                        )
-                    )
+            raw = self.instance.rcon_client.send_command(
+                f"/sc local out={{}} "
+                f"for _,e in pairs(game.surfaces[1].find_entities_filtered{{"
+                f"name='gun-turret',"
+                f"area={{{{{cx-r},{cy-r}}},{{{cx+r},{cy+r}}}}}"
+                f"}}) do "
+                f"local ammo=0 "
+                f"if e.get_inventory(defines.inventory.turret_ammo) then "
+                f"  ammo=e.get_inventory(defines.inventory.turret_ammo).get_item_count('firearm-magazine') "
+                f"  +e.get_inventory(defines.inventory.turret_ammo).get_item_count('piercing-rounds-magazine') "
+                f"end "
+                f"out[#out+1]=e.position.x..','..e.position.y..','..ammo..','..e.health "
+                f"end rcon.print(table.concat(out,';'))"
+            ).strip()
         except Exception:
-            pass
+            return []
+        turrets = []
+        if raw:
+            for part in raw.split(";"):
+                if not part:
+                    continue
+                try:
+                    x, y, ammo, hp = part.split(",")
+                    turrets.append((float(x), float(y), float(ammo), float(hp)))
+                except ValueError:
+                    continue
+        logger.debug("_current_turrets: found %d gun-turrets in %.3fs",
+                     len(turrets), _time_module.perf_counter() - t0)
         return turrets
 
     def _seed_turret_positions_if_needed(self) -> None:
@@ -474,6 +866,145 @@ class TowerDefenseEnv(gymnasium.Env):
                     mat[i, j] = 1
         self._anchor_reach_matrix = mat
 
+    def _report_save_state(self) -> None:
+        """Print a one-time save validation report to stdout on first reset.
+
+        Covers every entity the scenario depends on (including those without a
+        Python Prototype such as infinity-pipe / infinity-chest), the radar_view
+        grid channel occupancy, slot/anchor geometry, reach matrix, and obs-space
+        conformance. Intended to be read before training starts.
+        """
+        rc = self.instance.rcon_client
+        lines: list = ["", "=" * 60, "  TowerDefenseEnv — save validation report", "=" * 60]
+
+        def rcon_int(cmd: str, default: int = 0) -> int:
+            try:
+                return int(float(rc.send_command(cmd).strip()))
+            except Exception:
+                return default
+
+        def ok(val, good: bool) -> str:
+            return f"{val:>6}  {'[OK]' if good else '[WARN]'}"
+
+        # --- Entity census (direct RCON, sees ALL entities regardless of Prototype) ---
+        # "unit-spawner" is an entity TYPE (biter nests: biter-spawner, spitter-spawner,
+        # etc.) — must be queried with {type=...}. Everything else is queried by name.
+        lines.append("  Entities on surface:")
+        all_ok = True
+
+        # Entries: (display_label, rcon_filter_fragment, min_count, required)
+        # rcon_filter_fragment is inserted verbatim into find_entities_filtered{...}
+        checks = [
+            ("radar",            "name='radar'",           1, True),
+            ("boiler",           "name='boiler'",          1, True),
+            ("gun-turret",       "name='gun-turret'",      1, True),
+            ("stone-wall",       "name='stone-wall'",      0, False),
+            ("unit-spawner",     "type='unit-spawner'",    1, False),  # biter nests (ok if absent — place in map editor)
+            ("infinity-chest",   "name='infinity-chest'",  1, True),
+            ("infinity-pipe",    "name='infinity-pipe'",   1, True),
+        ]
+        for label, flt, min_count, required in checks:
+            n = rcon_int(
+                f"/sc local n=0 for _,e in pairs(game.surfaces[1]"
+                f".find_entities_filtered{{{flt}}}) do n=n+1 end rcon.print(n)"
+            )
+            good = n >= min_count
+            if required and not good:
+                all_ok = False
+            marker = "[OK]" if good else ("[WARN — missing!]" if required else "[WARN]")
+            lines.append(f"    {label:<20} {n:>4}   {marker}")
+
+        # Evolution factor
+        evo = 0.0
+        try:
+            evo = float(rc.send_command(
+                "/sc rcon.print(game.forces['enemy'].get_evolution_factor(game.surfaces[1]))"
+            ).strip())
+        except Exception:
+            pass
+        lines.append(f"    {'evolution factor':<20} {evo:.4f}")
+        evo_target = (
+            "save default" if self.config.evolution_factor is None
+            else f"{self.config.evolution_factor:.4f}"
+        )
+        group_target = (
+            "engine default" if self.config.max_unit_group_size is None
+            else str(self.config.max_unit_group_size)
+        )
+        lines.append(f"    {'evolution target':<20} {evo_target}")
+        lines.append(f"    {'max group size':<20} {group_target}")
+
+        # --- Grid channel occupancy (radar_view) ---------------------------------
+        lines.append("  Grid channels (radar_view):")
+        channel_names = [
+            "0 empty", "1 wall", "2 turret", "3 ammo%",
+            "4 biter", "5 spitter", "6 spawner", "7 character",
+        ]
+        try:
+            grid = self.instance.first_namespace._radar_view(
+                center_x=self._center_x,
+                center_y=self._center_y,
+                radius=int(self._radius),
+                cell_size=self.cell_size,
+                charted_only=True,
+            )
+            for ch, ch_name in enumerate(channel_names):
+                cells = int(np.count_nonzero(grid[ch]))
+                total = grid.shape[1] * grid.shape[2]
+                lines.append(f"    ch{ch_name:<12}  {cells:>5} / {total} cells non-zero")
+        except Exception as e:
+            lines.append(f"    [radar_view failed: {e}]")
+
+        # --- Slot / anchor / reach geometry -------------------------------------
+        n_slots = 0 if self._turret_slots is None else len(self._turret_slots)
+        n_anchors = 0 if self._anchor_slots is None else len(self._anchor_slots)
+        n_boilers = 0 if self._boiler_slots is None else len(self._boiler_slots)
+        lines.append(f"  Turret slots  : {n_slots} (cap {self.max_slots})")
+        lines.append(f"  Anchor tiles  : {n_anchors} (cap {self.max_anchors})")
+        lines.append(f"  Boilers       : {n_boilers} (cap {self.max_boilers})")
+
+        if self._anchor_reach_matrix is not None and n_slots > 0 and n_anchors > 0:
+            mat = self._anchor_reach_matrix
+            reachable_slots = sum(
+                1 for j in range(n_slots)
+                if any(mat[i, j] for i in range(n_anchors))
+            )
+            orphan_slots = n_slots - reachable_slots
+            lines.append(
+                f"  Reach matrix  : {reachable_slots}/{n_slots} slots reachable from ≥1 anchor"
+                + ("  [OK]" if orphan_slots == 0 else f"  [WARN — {orphan_slots} orphan slot(s)]")
+            )
+            if orphan_slots:
+                all_ok = False
+        else:
+            lines.append("  Reach matrix  : not built")
+
+        # --- Observation space conformance --------------------------------------
+        try:
+            obs_space = self.observation_space
+            sample = obs_space.sample()
+            obs_ok = obs_space.contains(sample)
+            lines.append(f"  Obs space sample conformance: {'[OK]' if obs_ok else '[FAIL]'}")
+        except Exception as e:
+            lines.append(f"  Obs space check: [FAIL] {e}")
+            all_ok = False
+
+        # --- Vector env compatibility (spaces are serialisable) -----------------
+        try:
+            import pickle
+            pickle.dumps(self.observation_space)
+            pickle.dumps(self.action_space)
+            lines.append("  VecEnv pickle  : [OK]  (spaces are serialisable)")
+        except Exception as e:
+            lines.append(f"  VecEnv pickle  : [FAIL] {e}")
+            all_ok = False
+
+        lines.append("=" * 60)
+        lines.append(f"  Overall: {'READY' if all_ok else 'WARNINGS — check above'}")
+        lines.append("=" * 60)
+        lines.append("")
+        print("\n".join(lines))
+
     def _delete_turret_subset(self) -> None:
         """Destroy a random subset of slot turrets and give them to the agent.
 
@@ -549,11 +1080,61 @@ class TowerDefenseEnv(gymnasium.Env):
     def step(
         self, action: Dict[str, Any]
     ) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
+        """Resilient wrapper around _step_impl.
+
+        If RCON drops mid-step (human client joined to spectate, or the server
+        crashed and Docker restarted it), reconnect and end the episode cleanly
+        so SB3 calls reset() rather than the whole training run dying.
+        """
+        try:
+            obs, reward, terminated, truncated, info = self._step_impl(action)
+            self._last_obs = obs
+            return obs, reward, terminated, truncated, info
+        except _RCONNetworkError as e:
+            logger.warning(
+                "[step %d] RCON dropped (%s) — reconnecting and ending episode",
+                self._step_count, e,
+            )
+            try:
+                self.instance.reconnect_rcon(pause_after=True)
+                logger.warning("[step %d] RCON reconnected; episode terminated", self._step_count)
+            except Exception as re:
+                logger.error("[step %d] RCON reconnect FAILED: %s", self._step_count, re)
+            obs = self._last_obs if self._last_obs is not None else self._zero_obs()
+            info = {
+                "step": self._step_count,
+                "elapsed_ticks": -1,
+                "wave": self._wave_number,
+                "invalid_action": False,
+                "is_moving": False,
+                "kills": 0, "turrets_lost": 0, "walls_lost": 0,
+                "buildings_lost": 0, "boilers_lost": 0,
+                "coverage": self._cur_coverage,
+                "rcon_dropped": True,
+            }
+            # Terminate so SB3 resets; penalize like a death (state was lost).
+            return obs, self.config.terminal_penalty, True, False, info
+
+    def _zero_obs(self) -> Dict[str, np.ndarray]:
+        """A valid all-zeros observation, used when no prior obs is cached."""
+        return {k: np.zeros(space.shape, dtype=space.dtype)
+                for k, space in self.observation_space.spaces.items()}
+
+    def _step_impl(
+        self, action: Dict[str, Any]
+    ) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
         self._step_count += 1
         self._total_steps += 1
 
+        t_step_start = _time_module.perf_counter()
+        logger.debug("[step %d] ── BEGIN ──────────────────────────────", self._step_count)
+
         # Execute action
+        t_act = _time_module.perf_counter()
         invalid = self._execute_action(action)
+        logger.debug("[step %d] action=%s  invalid=%s  took=%.3fs",
+                     self._step_count, self._action_name(action), invalid,
+                     _time_module.perf_counter() - t_act)
 
         # Unpause, let game run for decision_cadence ticks, then pause.
         # If RCON drops while the game is running (e.g. a human client joins),
@@ -563,8 +1144,13 @@ class TowerDefenseEnv(gymnasium.Env):
         except ImportError:
             RCONClosed = Exception  # pragma: no cover
 
+        t0 = _time_module.perf_counter()
         self.instance.unpause()
         sleep_seconds = self.decision_cadence / 60.0 / self.game_speed
+        logger.debug(
+            "[step %d] UNPAUSE — cadence=%d ticks, sleeping %.3fs (game_speed=%.1fx)",
+            self._step_count, self.decision_cadence, sleep_seconds, self.game_speed,
+        )
         if sleep_seconds > 0:
             _time_module.sleep(sleep_seconds)
         try:
@@ -575,8 +1161,13 @@ class TowerDefenseEnv(gymnasium.Env):
                 "reconnecting and pausing — some ticks may have elapsed."
             )
             self.instance.reconnect_rcon(pause_after=True)
+        t1 = _time_module.perf_counter()
 
         elapsed_ticks = self.instance.get_elapsed_ticks()
+        logger.debug(
+            "[step %d] PAUSE   — elapsed_ticks=%d  wall=%.3fs",
+            self._step_count, elapsed_ticks, t1 - t0,
+        )
 
         # Poll the async walker: it advanced the character during the unpaused
         # window. Update transit state; snap the current anchor on arrival so the
@@ -588,6 +1179,13 @@ class TowerDefenseEnv(gymnasium.Env):
         elif self._move_target >= 0:
             self._current_anchor_index = self._move_target
             self._move_target = -1
+
+        # Read and clear TD reward/loss events immediately after the game has
+        # advanced. The current observation includes these directional losses,
+        # and reward/termination use the same event window.
+        ev = self._read_events()
+        self._last_events = ev
+        self._accumulate_episode_events(ev)
 
         # --- Runtime wave triggering (DISABLED) ---------------------------------
         # The map already ships with baked-in biter nests that spawn and path to
@@ -601,10 +1199,21 @@ class TowerDefenseEnv(gymnasium.Env):
         # -----------------------------------------------------------------------
 
         # Get observation
+        t_obs = _time_module.perf_counter()
         obs = self._get_observation()
+        logger.debug("[step %d] OBS     — char_hp=%.1f  radar_hp=%.1f  "
+                     "coverage=%.2f  threats=%d  took=%.3fs",
+                     self._step_count,
+                     self._cur_char_hp, self._cur_radar_hp,
+                     self._cur_coverage,
+                     int(obs["group_valid_mask"].sum()),
+                     _time_module.perf_counter() - t_obs)
 
         # Compute reward
-        reward = self._compute_reward(invalid)
+        t_rew = _time_module.perf_counter()
+        reward = self._compute_reward(invalid, action)
+        logger.debug("[step %d] REWARD  — r=%.4f  took=%.3fs",
+                     self._step_count, reward, _time_module.perf_counter() - t_rew)
 
         # Check termination
         terminated = self._check_terminated(obs)
@@ -616,6 +1225,15 @@ class TowerDefenseEnv(gymnasium.Env):
             reward += self.config.terminal_bonus
 
         ev = getattr(self, "_last_events", {}) or {}
+        episode_ev = getattr(self, "_episode_events", {}) or {}
+        action_type = int(action.get("action_type", ACTION_NOOP))
+        action_names = {
+            ACTION_NOOP: "noop",
+            ACTION_PICK_TURRET: "pick",
+            ACTION_PLACE_TURRET: "place",
+            ACTION_REFILL_TURRET: "refill",
+            ACTION_MOVE_ANCHOR: "move",
+        }
         info = {
             "step": self._step_count,
             "elapsed_ticks": elapsed_ticks,
@@ -626,10 +1244,69 @@ class TowerDefenseEnv(gymnasium.Env):
             "turrets_lost": ev.get("turrets_lost", 0),
             "walls_lost": ev.get("walls_lost", 0),
             "buildings_lost": ev.get("buildings_lost", 0),
+            "boilers_lost": ev.get("boilers_lost", 0),
+            "walls_lost_step": ev.get("walls_lost", 0),
+            "turrets_lost_step": ev.get("turrets_lost", 0),
+            "boilers_lost_step": ev.get("boilers_lost", 0),
+            "walls_lost_episode": episode_ev.get("walls_lost", 0),
+            "turrets_lost_episode": episode_ev.get("turrets_lost", 0),
+            "boilers_lost_episode": episode_ev.get("boilers_lost", 0),
+            "action_type_id": action_type,
+            "action_name": action_names.get(action_type, "unknown"),
             "coverage": self._cur_coverage,
         }
+        for key in (
+            "wall_n", "wall_e", "wall_s", "wall_w",
+            "turret_n", "turret_e", "turret_s", "turret_w",
+        ):
+            info[key] = ev.get(key, 0)
+            info[f"{key}_episode"] = episode_ev.get(key, 0)
+
+        # ── per-step summary line (INFO so it shows in normal runs) ──────────
+        logger.info(
+            "step %4d | ticks=%6d | act=%-14s | r=%+7.3f | "
+            "char=%.0f  radar=%.0f  cov=%.0f%%  kills=%d  wall_lost=%d  "
+            "moving=%s  invalid=%s  wall=%.2fs",
+            self._step_count, elapsed_ticks,
+            self._action_name(action),
+            reward,
+            self._cur_char_hp, self._cur_radar_hp,
+            self._cur_coverage * 100,
+            ev.get("kills", 0), ev.get("walls_lost", 0),
+            "Y" if self._moving else "N",
+            "Y" if invalid else "N",
+            _time_module.perf_counter() - t_step_start,
+        )
+
+        if terminated or truncated:
+            logger.info("──── EPISODE END ──── terminated=%s truncated=%s "
+                        "ticks=%d  total_reward_contribution=%.3f",
+                        terminated, truncated, elapsed_ticks, reward)
 
         return obs, reward, terminated, truncated, info
+
+    @staticmethod
+    def _action_name(action: Dict[str, Any]) -> str:
+        """Human-readable action label for logging."""
+        _NAMES = {
+            ACTION_NOOP: "NOOP",
+            ACTION_PICK_TURRET: "PICK_TURRET",
+            ACTION_PLACE_TURRET: "PLACE_TURRET",
+            ACTION_REFILL_TURRET: "REFILL_TURRET",
+            ACTION_MOVE_ANCHOR: "MOVE_ANCHOR",
+        }
+        atype = int(action.get("action_type", ACTION_NOOP))
+        name = _NAMES.get(atype, f"?({atype})")
+        slot = int(action.get("slot_index", 0))
+        anchor = int(action.get("anchor_index", 0))
+        ammo = int(action.get("ammo_amount", 0))
+        if atype == ACTION_MOVE_ANCHOR:
+            return f"{name}[{anchor}]"
+        if atype in (ACTION_PLACE_TURRET, ACTION_PICK_TURRET):
+            return f"{name}[s{slot}]"
+        if atype == ACTION_REFILL_TURRET:
+            return f"{name}[s{slot},a{ammo}]"
+        return name
 
     def _execute_action(self, action: Dict[str, Any]) -> bool:
         """Execute the given slot-based action. Returns True if invalid."""
@@ -687,7 +1364,7 @@ class TowerDefenseEnv(gymnasium.Env):
                     return True  # empty slot, nothing to refill
                 amount = max(1, ammo_amount)
                 ns.insert_item(
-                    Prototype.FirearmMagazine,
+                    self._ammo_prototype,
                     turret_here,
                     amount,
                 )
@@ -701,15 +1378,21 @@ class TowerDefenseEnv(gymnasium.Env):
             return True
 
     def _find_turret_at(self, x: float, y: float):
-        """Return the gun-turret entity occupying slot (x, y), or None."""
+        """Return a GunTurret entity at slot (x, y), or None.
+
+        Filters by entity type so only ≤1 gun-turret is serialised over RCON
+        (instead of the full 500+ entity list that get_entities returns without
+        a filter, which causes the step to hang on maps with many walls).
+        """
         ns = self.instance.first_namespace
         try:
             entities = ns.get_entities(
+                entities={Prototype.GunTurret},
                 position=Position(x=x, y=y),
                 radius=self._slot_epsilon,
             )
             for e in entities:
-                if e.name == "gun-turret":
+                if getattr(e, "name", None) == "gun-turret":
                     return e
         except Exception:
             pass
@@ -726,6 +1409,10 @@ class TowerDefenseEnv(gymnasium.Env):
         n = 0 if self._anchor_slots is None else len(self._anchor_slots)
         if anchor_index < 0 or anchor_index >= n:
             return True  # padding / out-of-range anchor
+        if self._moving and anchor_index == self._move_target:
+            return True  # already moving there
+        if not self._moving and anchor_index == self._current_anchor_index:
+            return True  # already standing there
         ax = float(self._anchor_slots[anchor_index][0])
         ay = float(self._anchor_slots[anchor_index][1])
         try:
@@ -741,6 +1428,23 @@ class TowerDefenseEnv(gymnasium.Env):
             logger.debug(f"Move-to-anchor failed: {e}")
             return True
 
+    def _nearest_anchor_index(self) -> int:
+        """Return the anchor nearest to the current character position."""
+        n = 0 if self._anchor_slots is None else len(self._anchor_slots)
+        if n <= 0:
+            return 0
+        chx, chy = self._get_char_pos()
+        best_idx = 0
+        best_dist = float("inf")
+        for i in range(n):
+            ax = float(self._anchor_slots[i, 0])
+            ay = float(self._anchor_slots[i, 1])
+            dist = math.hypot(ax - chx, ay - chy)
+            if dist < best_dist:
+                best_idx = i
+                best_dist = dist
+        return best_idx
+
     def _plan_path(self, start: Position, finish: Position) -> list:
         """Return an ordered waypoint list from start to finish.
 
@@ -750,15 +1454,28 @@ class TowerDefenseEnv(gymnasium.Env):
         or the game is paused). Swapping in richer routing later is transparent.
         """
         ns = self.instance.first_namespace
+        was_paused = True
         try:
+            try:
+                was_paused = self.instance.game_control.is_paused()
+            except Exception:
+                was_paused = True
+            if was_paused:
+                self.instance.unpause()
             handle = ns._request_path(
                 start, finish, allow_paths_through_own_entities=True, resolution=-1
             )
-            waypoints = ns._get_path(handle)
+            waypoints = ns._get_path(handle, max_attempts=4)
             if waypoints:
                 return waypoints
         except Exception as e:
             logger.debug(f"A* path failed ({e}); using straight-line walk")
+        finally:
+            if was_paused:
+                try:
+                    self.instance.pause()
+                except Exception:
+                    pass
         return [finish]
 
     def _get_char_pos(self) -> Tuple[float, float]:
@@ -795,10 +1512,36 @@ class TowerDefenseEnv(gymnasium.Env):
         try:
             return self.instance.first_namespace._read_td_events()
         except Exception:
-            return {
-                "kills": 0, "turrets_lost": 0, "walls_lost": 0,
-                "buildings_lost": 0, "radar_lost": 0, "char_died": 0,
-            }
+            return self._zero_events()
+
+    @staticmethod
+    def _zero_events() -> Dict[str, int]:
+        return {
+            "kills": 0,
+            "turrets_lost": 0,
+            "walls_lost": 0,
+            "buildings_lost": 0,
+            "boilers_lost": 0,
+            "radar_lost": 0,
+            "char_died": 0,
+            "wall_n": 0,
+            "wall_e": 0,
+            "wall_s": 0,
+            "wall_w": 0,
+            "turret_n": 0,
+            "turret_e": 0,
+            "turret_s": 0,
+            "turret_w": 0,
+        }
+
+    def _accumulate_episode_events(self, ev: Dict[str, int]) -> None:
+        """Add the latest event window into per-episode totals."""
+        if not self._episode_events:
+            self._episode_events = self._zero_events()
+        for key in self._episode_events:
+            self._episode_events[key] = self._episode_events.get(key, 0) + int(
+                ev.get(key, 0)
+            )
 
     def _get_radar_hp(self) -> float:
         """Read the radar's current HP directly (0 if no radar / destroyed)."""
@@ -885,25 +1628,10 @@ class TowerDefenseEnv(gymnasium.Env):
         except Exception:
             inv_arr = np.zeros(len(TRACKED_ITEMS), dtype=np.int32)
 
-        # Entities (used for turret occupancy)
-        entities = []
-        try:
-            entities = ns.get_entities(
-                position=Position(x=cx0, y=cy0),
-                radius=self._radius,
-            )
-        except Exception:
-            pass
-        turrets = [
-            (
-                float(e.position.x),
-                float(e.position.y),
-                float(getattr(e, "ammo_count", 0) or 0),
-                float(getattr(e, "health", 0) or 0),
-            )
-            for e in entities
-            if getattr(e, "name", None) == "gun-turret"
-        ]
+        # Turret occupancy — use a targeted RCON query (gun-turrets only) so
+        # walls, infinity-pipes, chests, etc. are never serialised over RCON.
+        turrets = self._current_turrets()
+        boilers = self._current_boilers()
 
         # Turret slots + masks (positions normalized; reach from LIVE char pos)
         slots_arr = np.zeros((MAX_SLOTS, SLOT_FEATURES), dtype=np.float32)
@@ -983,6 +1711,22 @@ class TowerDefenseEnv(gymnasium.Env):
             threat_closeness,
         ) = self._build_threat_obs(cx0, cy0, norm, turrets)
 
+        # Boilers (critical power targets).
+        boilers_arr = np.zeros((MAX_BOILERS, BOILER_FEATURES), dtype=np.float32)
+        boiler_valid_mask = np.zeros(MAX_BOILERS, dtype=np.int8)
+        nb = 0 if self._boiler_slots is None else len(self._boiler_slots)
+        if nb > 0:
+            boiler_alive, boiler_health = self._boiler_status(boilers)
+            for i in range(min(nb, MAX_BOILERS)):
+                bx, by = self._boiler_slots[i]
+                boilers_arr[i] = [
+                    (bx - cx0) / norm,
+                    (by - cy0) / norm,
+                    1.0 if boiler_alive[i] else 0.0,
+                    boiler_health[i] / BOILER_HP_NORM,
+                ]
+                boiler_valid_mask[i] = 1
+
         # Movement / transit state
         movement_arr = np.zeros(MOVEMENT_FEATURES, dtype=np.float32)
         movement_arr[0] = 1.0 if self._moving else 0.0
@@ -994,6 +1738,19 @@ class TowerDefenseEnv(gymnasium.Env):
             movement_arr[2] = rem / norm
             movement_arr[3] = (tx - chx) / rmag
             movement_arr[4] = (ty - chy) / rmag
+
+        # Directional losses from the decision window that just elapsed.
+        ev = getattr(self, "_last_events", {}) or {}
+        recent_losses = np.array(
+            [
+                ev.get("wall_n", 0), ev.get("wall_e", 0),
+                ev.get("wall_s", 0), ev.get("wall_w", 0),
+                ev.get("turret_n", 0), ev.get("turret_e", 0),
+                ev.get("turret_s", 0), ev.get("turret_w", 0),
+            ],
+            dtype=np.float32,
+        )
+        recent_losses = np.clip(recent_losses, 0.0, LOSS_COUNT_NORM) / LOSS_COUNT_NORM
 
         # Game (elapsed normalized to [0, 1] over the episode budget)
         elapsed_ticks = self.instance.get_elapsed_ticks()
@@ -1027,7 +1784,10 @@ class TowerDefenseEnv(gymnasium.Env):
             "group_valid_mask": group_valid_mask,
             "nests": nests_arr,
             "nest_valid_mask": nest_valid_mask,
+            "boilers": boilers_arr,
+            "boiler_valid_mask": boiler_valid_mask,
             "movement": movement_arr,
+            "recent_losses": recent_losses,
             "character": char_arr,
             "radar": radar_arr,
             "game": game_arr,
@@ -1100,6 +1860,10 @@ class TowerDefenseEnv(gymnasium.Env):
             ]
             nest_valid_mask[i] = 1
 
+        n_groups = int(group_valid_mask.sum())
+        n_nests = int(nest_valid_mask.sum())
+        logger.debug("_build_threat_obs: %d biter group(s), %d nest(s), "
+                     "closeness=%.3f", n_groups, n_nests, closeness)
         return groups_arr, group_valid_mask, nests_arr, nest_valid_mask, closeness
 
     @staticmethod
@@ -1123,13 +1887,13 @@ class TowerDefenseEnv(gymnasium.Env):
         except Exception:
             return 0.0
 
-    def _compute_reward(self, invalid: bool) -> float:
+    def _compute_reward(self, invalid: bool, action: Optional[Dict[str, Any]] = None) -> float:
         """Compute step reward from server-side death events + stashed raw state.
 
-        Reads (and clears) the death/kill counters accumulated during the last
-        decision window, applies the destruction penalties you specified, the
-        character/radar damage penalties, and light dense shaping that anneals to
-        zero over cfg.shaping_decay_steps. Stashes the events for _check_terminated.
+        Uses the already-read death/kill counters accumulated during the last
+        decision window, applies destruction, damage, movement, and invalid
+        penalties, then adds light delta shaping that anneals to zero over
+        cfg.shaping_decay_steps.
         """
         cfg = self.config
         reward = 0.0
@@ -1137,9 +1901,8 @@ class TowerDefenseEnv(gymnasium.Env):
         # Survival.
         reward += cfg.alpha_survive
 
-        # Event-based kills + destruction (read-and-clear for this window).
-        ev = self._read_events()
-        self._last_events = ev
+        # Event-based kills + destruction (read-and-cleared before observation).
+        ev = getattr(self, "_last_events", None) or self._zero_events()
         reward += cfg.beta_kills * ev.get("kills", 0)
         reward -= cfg.p_wall_destroyed * ev.get("walls_lost", 0)
         reward -= cfg.p_turret_destroyed * ev.get("turrets_lost", 0)
@@ -1159,12 +1922,25 @@ class TowerDefenseEnv(gymnasium.Env):
         if invalid:
             reward -= cfg.epsilon_invalid
 
+        # Movement penalties. A move command has a small fixed cost; remaining
+        # in transit costs a little each decision window so repeated/long moves
+        # do not dominate training.
+        action_type = int((action or {}).get("action_type", ACTION_NOOP))
+        if not invalid and action_type == ACTION_MOVE_ANCHOR:
+            reward -= cfg.p_move_command
+        if self._moving:
+            reward -= cfg.p_move_transit
+
         # Dense shaping, annealed to 0 over training.
         decay = max(0.0, 1.0 - self._total_steps / max(1, cfg.shaping_decay_steps))
         if decay > 0.0:
-            reward += decay * cfg.w_coverage * self._cur_coverage
-            reward += decay * cfg.w_ammo * self._cur_ammo_frac
+            coverage_delta = max(0.0, self._cur_coverage - self._prev_coverage)
+            ammo_delta = max(0.0, self._cur_ammo_frac - self._prev_ammo_frac)
+            reward += decay * cfg.w_coverage_delta * coverage_delta
+            reward += decay * cfg.w_ammo_delta * ammo_delta
             reward -= decay * cfg.w_threat * self._cur_threat_closeness
+        self._prev_coverage = self._cur_coverage
+        self._prev_ammo_frac = self._cur_ammo_frac
 
         return reward
 
@@ -1175,6 +1951,16 @@ class TowerDefenseEnv(gymnasium.Env):
         ev = getattr(self, "_last_events", {}) or {}
         if self._has_radar and (self._cur_radar_hp <= 0 or ev.get("radar_lost", 0) > 0):
             return True
+        boiler_valid = obs.get("boiler_valid_mask")
+        boiler_rows = obs.get("boilers")
+        if boiler_valid is not None and boiler_rows is not None:
+            n_boilers = int(np.asarray(boiler_valid).sum())
+            if n_boilers > 0:
+                alive_count = int(np.count_nonzero(np.asarray(boiler_rows)[:n_boilers, 2] > 0.5))
+                lost_count = n_boilers - alive_count
+                threshold = max(1, int(math.ceil(n_boilers * self.config.boiler_loss_fraction)))
+                if lost_count >= threshold:
+                    return True
         if self._cur_char_hp <= 0 or ev.get("char_died", 0) > 0:
             return True
         return False

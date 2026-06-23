@@ -458,6 +458,8 @@ class FactorioInstance:
             "recipe_fluid_connection_mappings",
             "serialize",
             "serialize_direction_fix",
+            "tick_dispatcher",
+            "td_events",
         ]
         for script_name in init_scripts:
             self.lua_script_manager.load_init_into_game(script_name)

@@ -61,6 +61,11 @@ MAX_NESTS = 8
 # Per-nest feature width: [rel_cx, rel_cy, health_norm, dist_radar_norm, dir_dx, dir_dy]
 NEST_FEATURES = 6
 
+# Max boilers tracked as critical base structures.
+MAX_BOILERS = 32
+# Per-boiler feature width: [rel_x, rel_y, alive, health_norm]
+BOILER_FEATURES = 4
+
 # A cluster of at least this many live enemies is flagged as a "swarm"
 # (is_swarm=1). The big groups (~60) you described read very differently from
 # a nest at the symbolic level because of this flag + the count feature.
@@ -70,14 +75,20 @@ SWARM_THRESHOLD = 60
 # [is_moving, target_anchor_norm, remaining_dist_norm, head_dx, head_dy]
 MOVEMENT_FEATURES = 5
 
+# --- Recent directional structure losses ---
+# [wall_n, wall_e, wall_s, wall_w, turret_n, turret_e, turret_s, turret_w]
+RECENT_LOSS_FEATURES = 8
+
 # --- Normalization constants (used by the env to condition obs for the NN) ---
 COUNT_NORM = 100.0       # divide enemy counts by this
 ETA_NORM = 600.0         # ticks-to-base normalizer (~10s at 60tps)
 NEST_HP_NORM = 350.0     # spawner max HP ballpark
 CHAR_HP_NORM = 250.0     # character max HP ballpark
 RADAR_HP_NORM = 250.0    # radar max HP ballpark
+BOILER_HP_NORM = 200.0   # boiler max HP ballpark
 TURRET_HP_NORM = 400.0   # gun-turret max HP ballpark
 TURRET_AMMO_NORM = 10.0  # gun-turret ammo slot capacity ballpark
+LOSS_COUNT_NORM = 10.0   # recent loss count normalizer for one decision window
 
 
 def make_observation_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.Dict:
@@ -148,11 +159,27 @@ def make_observation_space(grid_size: int = DEFAULT_GRID_SIZE) -> spaces.Dict:
                 dtype=np.float32,
             ),
             "nest_valid_mask": spaces.MultiBinary(MAX_NESTS),
+            # Boilers are critical power targets read once from the map.
+            "boilers": spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(MAX_BOILERS, BOILER_FEATURES),
+                dtype=np.float32,
+            ),
+            "boiler_valid_mask": spaces.MultiBinary(MAX_BOILERS),
             # Transit state for the async A* walk (see TowerDefenseEnv._move_to_anchor).
             "movement": spaces.Box(
                 low=-np.inf,
                 high=np.inf,
                 shape=(MOVEMENT_FEATURES,),
+                dtype=np.float32,
+            ),
+            # Last decision-window directional losses relative to the radar:
+            # wall N/E/S/W then turret N/E/S/W, clipped and normalized.
+            "recent_losses": spaces.Box(
+                low=0.0,
+                high=np.inf,
+                shape=(RECENT_LOSS_FEATURES,),
                 dtype=np.float32,
             ),
             "character": spaces.Box(

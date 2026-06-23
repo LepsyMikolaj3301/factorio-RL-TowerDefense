@@ -25,6 +25,16 @@ class TDScenarioConfig:
     escalation_factor: float = 1.5
     ticks_per_wave: int = 3600       # 60 s at 60 tps
 
+    # --- Difficulty: biter strength & attack-group size ---
+    # Enemy evolution factor (0..1). Applied to the enemy force when the world is
+    # initialized and re-applied after every reset (a snapshot restore reverts
+    # the force's evolution to the captured value). None = keep the save's value.
+    evolution_factor: Optional[float] = None
+    # Factorio map_settings.unit_group.max_unit_group_size — the cap on biters per
+    # attack group. Larger = bigger swarms = harder. Applied on init + every reset.
+    # None = leave the engine/map default untouched.
+    max_unit_group_size: Optional[int] = None
+
     # --- Environment cadence ---
     decision_cadence: int = 60       # ticks between agent steps
     game_speed: float = 10.0
@@ -55,14 +65,24 @@ class TDScenarioConfig:
     # anchor tiles. Matches the chart radius used by _read_radar.
     anchor_scan_radius: float = 128.0
 
+    # --- Boilers ---
+    # Boilers are critical power structures read once from the loaded map. If at
+    # least this fraction of the initial boiler set is destroyed, the episode
+    # terminates and the next reset restores the map.
+    max_boiler_slots: int = 32
+    boiler_scan_radius: float = 128.0
+    boiler_loss_fraction: float = 1.0 / 3.0
+
     # --- Spawn & reset behaviour ---
     # Where the agent character is placed after each reset. The radar occupies
     # (0,0) by convention; (0,10) keeps the agent inside the walled ring but
     # off the radar tile.
     player_spawn_position: Tuple[float, float] = (0.0, 10.0)
-    # When False, _spawn_wave() is a no-op — biters must originate from the
-    # map's own Factorio AI (useful for debugging or map-only configs).
-    spawn_waves_at_runtime: bool = True
+    # When False, _spawn_wave() is a no-op — biters originate from the map's
+    # own Factorio AI (unit-spawners baked into the predefined save). This is
+    # the correct mode for the predefined-save workflow; True would require
+    # biter_director which is not used here.
+    spawn_waves_at_runtime: bool = False
     # When True, waves are sent from the map's baked-in unit-spawners (enemy
     # force). Falls back to the geometric-ring origin if no spawners exist.
     spawn_from_map_spawners: bool = True
@@ -73,6 +93,18 @@ class TDScenarioConfig:
     # original starting set on every reset, removing nests created by expansion
     # during the previous episode. Recorded once on first reset.
     restore_starting_nests_on_reset: bool = True
+    # Disable Factorio's enemy expansion so biters never create new nests beyond
+    # the ones baked into the save. The scenario control.lua sets this on a fresh
+    # map, but on_init never runs on a loaded save, so the env enforces it via
+    # RCON on the first reset (map_settings persist across snapshot restores).
+    disable_enemy_expansion: bool = True
+
+    # --- Ammo ---
+    # The magazine type the agent uses everywhere (starting inventory + the
+    # REFILL action). Must match the ammo granted in `starting_inventory`,
+    # otherwise refill inserts an item the agent does not carry and turrets
+    # never get ammo.
+    ammo_type: str = "piercing-rounds-magazine"
 
     # --- Threat tracking ---
     # A live enemy cluster of >= this many units is flagged is_swarm in the obs.
@@ -97,12 +129,16 @@ class TDScenarioConfig:
     p_turret_destroyed: float = 20.0       # very strong (turret permanently lost)
     p_building_destroyed: float = 20.0     # very strong
     p_radar_damage: float = 0.2            # per HP the radar (the "heart") loses
+    p_move_command: float = 0.25            # per valid MOVE_ANCHOR command
+    p_move_transit: float = 0.05            # per step spent walking/in transit
     terminal_bonus: float = 100.0          # survived to max_ticks
     terminal_penalty: float = -200.0       # radar destroyed or character died (very strong)
 
     # --- Dense shaping (annealed to 0 over shaping_decay_steps env steps) ---
-    w_coverage: float = 0.05   # reward for fraction of reachable slots filled
-    w_ammo: float = 0.02       # reward for fraction of live turrets carrying ammo
+    w_coverage: float = 0.0    # legacy absolute coverage shaping (kept disabled)
+    w_ammo: float = 0.0        # legacy absolute ammo shaping (kept disabled)
+    w_coverage_delta: float = 0.5  # reward when filled slot coverage improves
+    w_ammo_delta: float = 0.2      # reward when loaded-turret fraction improves
     w_threat: float = 0.05     # penalty scaling with closeness of the nearest swarm
     shaping_decay_steps: int = 200_000
 

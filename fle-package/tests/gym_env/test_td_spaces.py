@@ -13,11 +13,14 @@ from fle.env.gym_env.td_spaces import (
     DEFAULT_GRID_SIZE,
     MAX_SLOTS,
     MAX_ANCHORS,
+    MAX_BOILERS,
     MAX_GROUPS,
     MAX_NESTS,
+    BOILER_FEATURES,
     GROUP_FEATURES,
     NEST_FEATURES,
     MOVEMENT_FEATURES,
+    RECENT_LOSS_FEATURES,
     SLOT_FEATURES,
     TRACKED_ITEMS,
     make_observation_space,
@@ -70,7 +73,10 @@ class TestTDSpaces:
         assert obs_space["group_valid_mask"].shape == (MAX_GROUPS,)
         assert obs_space["nests"].shape == (MAX_NESTS, NEST_FEATURES)
         assert obs_space["nest_valid_mask"].shape == (MAX_NESTS,)
+        assert obs_space["boilers"].shape == (MAX_BOILERS, BOILER_FEATURES)
+        assert obs_space["boiler_valid_mask"].shape == (MAX_BOILERS,)
         assert obs_space["movement"].shape == (MOVEMENT_FEATURES,)
+        assert obs_space["recent_losses"].shape == (RECENT_LOSS_FEATURES,)
         # Action-conditioned reach masks for the pointer head.
         for k in ("place_reach_mask", "refill_reach_mask", "pick_reach_mask"):
             assert obs_space[k].shape == (MAX_SLOTS,)

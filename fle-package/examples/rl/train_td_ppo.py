@@ -2,7 +2,7 @@
 
 Use the canonical entry point instead:
 
-    python -m fle.rl.train --num-envs 4 --total-timesteps 1000000 --difficulty medium
+    python -m fle.rl.train --num-envs 4 --total-timesteps 1000000 --evolution-factor 0.5
 
 This file is kept only for backward compatibility and forwards to fle.rl.train.
 """

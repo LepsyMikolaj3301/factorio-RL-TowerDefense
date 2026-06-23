@@ -101,7 +101,14 @@ class TDExtractor(BaseFeaturesExtractor):
     """
 
     # Scalar obs keys concatenated into the scalar MLP.
-    SCALAR_KEYS = ("inventory", "character", "radar", "game", "movement")
+    SCALAR_KEYS = (
+        "inventory",
+        "character",
+        "radar",
+        "game",
+        "movement",
+        "recent_losses",
+    )
 
     def __init__(
         self,
@@ -130,12 +137,13 @@ class TDExtractor(BaseFeaturesExtractor):
         self.anchor_mlp = _mlp(spaces["anchors"].shape[1], set_dim)
         self.group_mlp = _mlp(spaces["biter_groups"].shape[1], set_dim)
         self.nest_mlp = _mlp(spaces["nests"].shape[1], set_dim)
+        self.boiler_mlp = _mlp(spaces["boilers"].shape[1], set_dim)
 
         # --- Scalar MLP ---
         scalar_dim = sum(int(np.prod(spaces[k].shape)) for k in self.SCALAR_KEYS)
         self.scalar_mlp = _mlp(scalar_dim, 2 * set_dim)
 
-        fused_in = cnn_dim + 4 * (2 * set_dim) + (2 * set_dim)
+        fused_in = cnn_dim + 5 * (2 * set_dim) + (2 * set_dim)
         self.fuse = nn.Sequential(nn.Linear(fused_in, features_dim), nn.ReLU())
 
         # Cached per-element embeddings from the last forward (for pointer heads).
@@ -162,12 +170,16 @@ class TDExtractor(BaseFeaturesExtractor):
         nest_pool = masked_mean_max_pool(
             self.nest_mlp(obs["nests"].float()), obs["nest_valid_mask"].float()
         )
+        boiler_pool = masked_mean_max_pool(
+            self.boiler_mlp(obs["boilers"].float()), obs["boiler_valid_mask"].float()
+        )
 
         scalars = torch.cat([obs[k].float().flatten(1) for k in self.SCALAR_KEYS], dim=-1)
         scal = self.scalar_mlp(scalars)
 
         fused = torch.cat(
-            [cnn, slot_pool, anchor_pool, group_pool, nest_pool, scal], dim=-1
+            [cnn, slot_pool, anchor_pool, group_pool, nest_pool, boiler_pool, scal],
+            dim=-1,
         )
         return self.fuse(fused)
 

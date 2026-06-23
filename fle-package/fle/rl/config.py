@@ -9,7 +9,10 @@ class TrainConfig:
     """All knobs for `fle.rl.train`. Sensible defaults for a first real run."""
 
     # --- Environment / scenario ---
-    difficulty: str = "medium"          # easy | medium | hard
+    # Difficulty is driven by two engine knobs applied on world init + every
+    # reset (None = keep the save's value). See TDScenarioConfig.
+    evolution_factor: Optional[float] = None   # enemy evolution (0..1)
+    max_unit_group_size: Optional[int] = None  # cap on biters per attack group
     save_path: Optional[str] = None     # prebuilt Factorio save (else container default)
     num_envs: int = 1                   # parallel containers
     use_subproc: bool = True            # SubprocVecEnv when num_envs > 1
@@ -46,3 +49,29 @@ class TrainConfig:
     use_wandb: bool = False
     wandb_project: str = "factorio-td"
     resume: Optional[str] = None       # path to a saved model .zip to resume from
+
+    # --- Debug ---
+    # "" = off  |  "info" = one line per step  |  "verbose" = per-call timings
+    debug_env: str = ""
+
+
+@dataclass
+class EvalConfig:
+    """All knobs for `fle.rl.eval`. Runs one episode of a trained model (no learning)."""
+
+    model_path: str                      # required: path to a saved .zip (final_model/best/checkpoint)
+    # Difficulty knobs applied on world init + every reset (None = save default).
+    evolution_factor: Optional[float] = None   # enemy evolution (0..1)
+    max_unit_group_size: Optional[int] = None  # cap on biters per attack group
+    save_path: Optional[str] = None      # prebuilt Factorio save (else container default)
+    run_idx: int = 0                     # which container to connect to
+    game_speed: Optional[float] = None   # override scenario game_speed (e.g. 1.0 to watch); None = config default
+    deterministic: bool = True           # argmax over masked logits vs sample
+    max_steps: int = 100_000             # safety cap so a stuck episode can't run forever
+    device: str = "auto"                 # "auto" -> CUDA if available, else CPU
+    seed: int = 0
+
+    # --- Output ---
+    log_dir: str = "./td_runs"
+    run_name: Optional[str] = None       # output dir name; default derived from model name
+    output_json: Optional[str] = None    # explicit path; default <run_dir>/eval_results.json

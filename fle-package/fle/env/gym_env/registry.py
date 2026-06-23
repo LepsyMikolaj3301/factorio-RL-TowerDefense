@@ -8,7 +8,6 @@ import gymnasium
 
 from fle.commons.cluster_ips import get_local_container_ips
 from fle.env import FactorioInstance
-from fle.eval.tasks import TaskFactory
 
 PORT_OFFSET = int(os.environ.get("PORT_OFFSET", 0))
 
@@ -113,17 +112,21 @@ def make_td_env(
     config=None,
     **kwargs,
 ):
-    """Create a Tower Defense gymnasium environment.
+    """Create a Tower Defense gymnasium environment backed by a predefined save.
+
+    The game server must already be running with the tower_defense save loaded
+    (``fle cluster start -n N``). The environment reads whatever is already on
+    the map (radar, turret slots, anchor tiles) on the first ``env.reset()``
+    call — it does NOT wipe or re-place any entities.
 
     Args:
-        run_idx: Container index for multi-env setups.
-        save_path: Optional path to a prebuilt Factorio save.
+        run_idx: Container index for multi-env setups (0-indexed).
+        save_path: Optional path to a Factorio save to load on connect.
         config: TDScenarioConfig instance (defaults to MEDIUM).
         **kwargs: Additional kwargs forwarded to TowerDefenseEnv.
     """
     from fle.env.gym_env.td_config import TDScenarioConfig
     from fle.env.gym_env.td_environment import TowerDefenseEnv
-    from fle.eval.tasks.tower_defense_task import TowerDefenseTask
 
     if config is None:
         config = TDScenarioConfig.MEDIUM
@@ -140,11 +143,14 @@ def make_td_env(
         all_technologies_researched=True,
         peaceful=False,
         save_path=save_path,
+        clear_entities=False,  # preserve the predefined save's radar, turrets, spawners
     )
 
-    task = TowerDefenseTask(starting_inventory_dict=config.starting_inventory)
-    task.setup(instance)
-
+    # TowerDefenseEnv.reset() handles all setup from the loaded save:
+    #   _read_radar(), _spawn_player(), _set_starting_inventory(),
+    #   _read_turret_slots(), _read_anchor_slots().
+    # Do NOT call TowerDefenseTask.setup() here — it wipes the map and tries
+    # to place a fresh radar, which breaks predefined-save environments.
     env = TowerDefenseEnv(instance=instance, config=config, **kwargs)
     return env
 

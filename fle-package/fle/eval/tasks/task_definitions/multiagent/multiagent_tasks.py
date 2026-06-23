@@ -10,6 +10,11 @@ from pydantic import BaseModel
 from typing import Literal, Dict, Any, Union, Optional, List
 from fle.env.game_types import Prototype
 
+
+def _model_dump(model: BaseModel) -> Dict[str, Any]:
+    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+
+
 # Task name constants for easy importing
 IRON_PLATE_THROUGHPUT_MULTIAGENT_FREE = "iron_plate_throughput_multiagent_free"
 IRON_PLATE_THROUGHPUT_MULTIAGENT_IMPOSTOR = "iron_plate_throughput_multiagent_impostor"
@@ -39,7 +44,7 @@ class MultiagentUnboundedThroughputTaskConfig(BaseModel):
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for compatibility with existing code."""
-        data = self.dict()
+        data = _model_dump(self)
         # Convert Prototype to string if necessary
         if isinstance(self.throughput_entity, Prototype):
             data["throughput_entity"] = self.throughput_entity.value

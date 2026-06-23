@@ -67,7 +67,7 @@ class ActionMaskWrapper(gymnasium.Wrapper):
         mask[ACTION_NOOP] = 1  # Noop always valid
 
         # Can move whenever the map has at least one anchor to move to.
-        anchors = obs.get("anchor_valid_mask", np.zeros(MAX_ANCHORS))
+        anchors = self._anchor_mask(obs)
         if np.any(anchors):
             mask[ACTION_MOVE_ANCHOR] = 1
 
@@ -108,7 +108,19 @@ class ActionMaskWrapper(gymnasium.Wrapper):
 
     def _anchor_mask(self, obs: dict) -> np.ndarray:
         valid = obs.get("anchor_valid_mask", np.zeros(MAX_ANCHORS, dtype=np.int8))
-        return np.asarray(valid, dtype=np.int8)
+        mask = np.asarray(valid, dtype=np.int8).copy()
+        try:
+            unwrapped = self.env.unwrapped
+            target = (
+                int(getattr(unwrapped, "_move_target", -1))
+                if getattr(unwrapped, "_moving", False)
+                else int(getattr(unwrapped, "_current_anchor_index", -1))
+            )
+            if 0 <= target < len(mask):
+                mask[target] = 0
+        except Exception:
+            pass
+        return mask
 
     def _augment(self, obs: dict) -> dict:
         obs["action_type_mask"] = self._compute_action_type_mask(obs)
@@ -155,9 +167,7 @@ class ActionMaskWrapper(gymnasium.Wrapper):
         ammo_mask = np.ones(NUM_AMMO_LEVELS, dtype=np.int8)
 
         # Anchor factor: real anchors, fallback to 0.
-        anchor_mask = np.asarray(
-            obs.get("anchor_valid_mask", np.zeros(MAX_ANCHORS, dtype=np.int8)), np.int8
-        ).copy()
+        anchor_mask = self._anchor_mask(obs).copy()
         if not anchor_mask.any():
             anchor_mask[0] = 1
 

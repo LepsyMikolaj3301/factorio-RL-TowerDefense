@@ -22,6 +22,7 @@ local function td_init()
             turrets_lost = 0,
             walls_lost = 0,
             buildings_lost = 0,
+            boilers_lost = 0,
             radar_lost = 0,
             char_died = 0,
         }
@@ -129,6 +130,9 @@ script.on_event(defines.events.on_entity_died, function(event)
             ev.walls_lost = ev.walls_lost + 1
         elseif etype == "radar" then
             ev.radar_lost = ev.radar_lost + 1
+        elseif ename == "boiler" then
+            ev.boilers_lost = (ev.boilers_lost or 0) + 1
+            ev.buildings_lost = ev.buildings_lost + 1
         elseif etype == "character" then
             ev.char_died = 1
         else

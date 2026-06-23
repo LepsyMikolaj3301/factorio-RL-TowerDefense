@@ -13,6 +13,7 @@ class TestRadarViewDecode:
 
     def _make_tool(self):
         conn = MagicMock()
+        conn.rcon_client = MagicMock()
         game_state = MagicMock()
         return RadarView(conn, game_state)
 
@@ -27,8 +28,7 @@ class TestRadarViewDecode:
         arr = np.arange(NUM_CHANNELS * grid_size * grid_size, dtype=np.uint8)
         encoded = "b64:" + base64.b64encode(arr.tobytes()).decode()
 
-        tool.execute = MagicMock(return_value=(encoded, None))
-        tool.clean_response = MagicMock(return_value=encoded)
+        tool.connection.rcon_client.send_command = MagicMock(return_value=encoded)
 
         result = tool(center_x=0, center_y=0, radius=radius, cell_size=cell_size)
 
@@ -49,8 +49,7 @@ class TestRadarViewDecode:
         bad_arr = np.zeros(10, dtype=np.uint8)
         encoded = "b64:" + base64.b64encode(bad_arr.tobytes()).decode()
 
-        tool.execute = MagicMock(return_value=(encoded, None))
-        tool.clean_response = MagicMock(return_value=encoded)
+        tool.connection.rcon_client.send_command = MagicMock(return_value=encoded)
 
         result = tool(center_x=0, center_y=0, radius=radius, cell_size=cell_size)
         assert result.shape == (NUM_CHANNELS, grid_size, grid_size)
@@ -61,8 +60,7 @@ class TestRadarViewDecode:
         tool = self._make_tool()
         radius = 4
 
-        tool.execute = MagicMock(return_value=("some error", None))
-        tool.clean_response = MagicMock(return_value="some error")
+        tool.connection.rcon_client.send_command = MagicMock(return_value="some error")
 
         result = tool(center_x=0, center_y=0, radius=radius)
         grid_size = int(2 * radius / 1.0)

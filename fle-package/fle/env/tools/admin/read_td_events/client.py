@@ -7,8 +7,17 @@ EVENT_KEYS = [
     "turrets_lost",
     "walls_lost",
     "buildings_lost",
+    "boilers_lost",
     "radar_lost",
     "char_died",
+    "wall_n",
+    "wall_e",
+    "wall_s",
+    "wall_w",
+    "turret_n",
+    "turret_e",
+    "turret_s",
+    "turret_w",
 ]
 
 
@@ -21,8 +30,7 @@ class ReadTdEvents(Tool):
         Read and reset the tower-defense reward event counters accumulated
         server-side since the last call (one decision window's worth of deaths).
 
-        :return: dict with keys kills, turrets_lost, walls_lost, buildings_lost,
-                 radar_lost, char_died.
+        :return: dict with death/loss counters including boilers_lost.
         """
         # Returns a small CSV string; read it directly over RCON (mirrors
         # radar_view) so we never depend on the pcall+dump table round-trip.

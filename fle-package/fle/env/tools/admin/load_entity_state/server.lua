@@ -14,15 +14,17 @@ storage.actions.load_entity_state = function(player, stored_json_data)
     -- First pass: Create all non-character entities and store character states
     for _, state in pairs(stored_data) do
         local name = unquote_string(state.name)
+        local state_type = unquote_string(state.type)
 
         if name == "character" then
             table.insert(character_states, state)
         elseif name == "item-on-ground" then
-            local item_name = unquote_string(state.type)
+            local item_name = state_type
             local item_count = tonumber(state.count)
 
             if prototypes.item[item_name] then
-                local entity = surface.create_entity({
+                pcall(function()
+                    surface.create_entity({
                     name = name,
                     position = {
                         x = tonumber(state.position.x),
@@ -34,24 +36,27 @@ storage.actions.load_entity_state = function(player, stored_json_data)
                     },
                     force = game.forces.player
                 })
+                end)
             else
                 -- game.print("Warning: Unknown item type " .. item_name)
             end
-        elseif state.type == "simple-entity-with-owner" then
+        elseif state_type == "simple-entity-with-owner" then
             -- Do nothing, we don't want to load in placeholder entities if they were somehow persisted!
         else
-            local entity = surface.create_entity({
-                name = name,
-                position = {
-                    x = tonumber(state.position.x),
-                    y = tonumber(state.position.y)
-                },
-                direction = tonumber(state.direction),
-                force = game.forces.player,
-                raise_built = true
-            })
+            local ok, entity = pcall(function()
+                return surface.create_entity({
+                    name = name,
+                    position = {
+                        x = tonumber(state.position.x),
+                        y = tonumber(state.position.y)
+                    },
+                    direction = tonumber(state.direction),
+                    force = game.forces.player,
+                    raise_built = true
+                })
+            end)
 
-            if entity then
+            if ok and entity then
                 created_entities[state.entity_number] = {
                     entity = entity,
                     state = state
@@ -202,6 +207,74 @@ storage.actions.load_entity_state = function(player, stored_json_data)
                 else
                     -- game.print("Warning: Unknown burning item " .. burning_name)
                 end
+            end
+        end
+
+        -- Restore infinity-chest generation settings. These filters drive the
+        -- prebuilt map's inserter-fed supply chain and are not represented by
+        -- ordinary chest inventory contents.
+        if state.infinity_settings and entity.name == "infinity-chest" then
+            local settings = state.infinity_settings
+            if settings.remove_unfiltered_items ~= nil then
+                pcall(function()
+                    entity.remove_unfiltered_items = settings.remove_unfiltered_items
+                end)
+            end
+
+            local filters = settings.filters or {}
+            -- helpers.json_to_table may decode arrays as map-like tables, so
+            -- never rely on #filters here.
+            local assign_filters = {}
+            local packed_filters = {}
+            local per_slot_filters = {}
+            for i, filter in pairs(filters) do
+                local item_name = unquote_string(filter.name)
+                if item_name and item_name ~= "" and prototypes.item[item_name] then
+                    local index = tonumber(filter.index) or tonumber(i) or #assign_filters + 1
+                    local restored_filter = {
+                        index = index,
+                        name = item_name,
+                        count = tonumber(filter.count) or 0,
+                        mode = unquote_string(filter.mode) or "at-least"
+                    }
+                    local slot_filter = {
+                        name = item_name,
+                        count = tonumber(filter.count) or 0,
+                        mode = unquote_string(filter.mode) or "at-least"
+                    }
+                    assign_filters[index] = restored_filter
+                    table.insert(packed_filters, restored_filter)
+                    per_slot_filters[index] = slot_filter
+                end
+            end
+
+            pcall(function()
+                entity.infinity_container_filters = assign_filters
+            end)
+            pcall(function()
+                entity.infinity_container_filters = packed_filters
+            end)
+
+            for index, restored_filter in pairs(assign_filters) do
+                pcall(function()
+                    entity.set_infinity_container_filter(index, restored_filter)
+                end)
+                if per_slot_filters[index] then
+                    pcall(function()
+                        entity.set_infinity_container_filter(index, per_slot_filters[index])
+                    end)
+                end
+            end
+
+            if packed_filters[1] then
+                pcall(function()
+                    entity.infinity_container_filter = packed_filters[1]
+                end)
+            end
+            if per_slot_filters[1] then
+                pcall(function()
+                    entity.infinity_container_filter = per_slot_filters[1]
+                end)
             end
         end
 

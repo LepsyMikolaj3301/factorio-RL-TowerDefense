@@ -119,6 +119,49 @@ storage.actions.save_entity_state = function(player_index, distance, player_enti
                 end
             end
 
+            -- Preserve infinity-chest generation settings. Regular inventory
+            -- serialization only captures the visible chest contents, not the
+            -- filters that make an infinity chest continuously feed inserters.
+            if entity.name == "infinity-chest" then
+                state.infinity_settings = {
+                    remove_unfiltered_items = false,
+                    filters = {}
+                }
+                local ok_remove, remove_unfiltered_items = pcall(function()
+                    return entity.remove_unfiltered_items
+                end)
+                if ok_remove and remove_unfiltered_items ~= nil then
+                    state.infinity_settings.remove_unfiltered_items = remove_unfiltered_items
+                end
+
+                local ok_filters, filters = pcall(function()
+                    return entity.infinity_container_filters
+                end)
+                if not ok_filters or not filters then
+                    ok_filters, filters = pcall(function()
+                        return entity.infinity_container_filter
+                    end)
+                end
+                if ok_filters and filters then
+                    -- Factorio versions expose either an array of filters or a
+                    -- single filter table. Normalize both shapes to an array.
+                    if filters.name then
+                        filters = {filters}
+                    end
+                    for idx, filter in pairs(filters) do
+                        local item_name = filter.name
+                        if item_name and item_name ~= "" then
+                            table.insert(state.infinity_settings.filters, {
+                                index = tonumber(filter.index) or tonumber(idx) or #state.infinity_settings.filters + 1,
+                                name = '"' .. tostring(item_name) .. '"',
+                                count = serialize_number(filter.count or 0),
+                                mode = '"' .. tostring(filter.mode or "at-least") .. '"'
+                            })
+                        end
+                    end
+                end
+            end
+
             -- Handle fluids
             if entity.fluidbox then
                 state.fluid_box = {}

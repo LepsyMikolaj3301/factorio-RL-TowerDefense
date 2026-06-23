@@ -116,7 +116,8 @@ class GetEntities(Tool):
                         break
 
                 if matching_prototype is None:
-                    if "name" in entity_data and entity_data["name"] != "entity-ghost":
+                    _no_warn = {"entity-ghost", "infinity-chest", "infinity-pipe"}
+                    if "name" in entity_data and entity_data["name"] not in _no_warn:
                         print(
                             f"Warning: No matching Prototype found for {entity_data['name']}"
                         )

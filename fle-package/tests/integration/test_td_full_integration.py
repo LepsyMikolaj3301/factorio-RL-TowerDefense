@@ -365,11 +365,11 @@ def test_td_full_integration(td_save_instance):
     print(f"[startup-validate] OK — masks/turrets/anchors/reach all agree with RCON "
           f"({len(live_turrets)} live turrets, {len(rcon_anchors)} anchors)")
 
-    # Isolate the walk from biter interference: live biters destroy turrets mid-
-    # walk and desync the (once-computed) place_slot_mask from the board. Disable
-    # the nests and clear any biters so the walk validates the place/service
-    # plumbing deterministically. (Reset-time biter/nest handling is covered in
-    # section 6b/7.) Re-enabled implicitly by env.reset() recreating the nests.
+    # Isolate the walks from biter interference: live biters destroy turrets
+    # mid-walk and desync the (once-computed) place_slot_mask from the board.
+    # Disable nests + clear biters before each walk. A try/finally below
+    # guarantees nests are re-enabled before the test exits (even on failure)
+    # so the container is left in a known-good state for subsequent runs.
     _set_nests_active(inst, False)
     env._clear_live_biters()
 
@@ -378,277 +378,287 @@ def test_td_full_integration(td_save_instance):
     inst.set_speed(10.0)
     inst.unpause()
 
-    # -- 5. WALK + SERVICE (single pass over every anchor) --------------------
-    placed: set = set()       # slot indices we placed a turret into
-    serviced: set = set()     # slot indices that received ammo at least once
-    visited: list = []        # anchor indices visited, in order
-    turrets_left = start_turrets
-    refill_events = 0
-    ammo_inserted = 0
+    try:
+        # -- 5. WALK + SERVICE (single pass over every anchor) ----------------
+        placed: set = set()       # slot indices we placed a turret into
+        serviced: set = set()     # slot indices that received ammo at least once
+        visited: list = []        # anchor indices visited, in order
+        turrets_left = start_turrets
+        refill_events = 0
+        ammo_inserted = 0
 
-    cx, cy = _get_char_pos(inst)
-    curr = Position(x=cx, y=cy)
+        cx, cy = _get_char_pos(inst)
+        curr = Position(x=cx, y=cy)
 
-    for i in range(n_anchors):
-        ax, ay = float(anchors[i, 0]), float(anchors[i, 1])
-        target = Position(x=ax, y=ay)
-        print(f"-> anchor[{i}] ({ax:.1f},{ay:.1f})")
-        curr = _astar_walk(ns, inst, curr, target)
-        env._current_anchor_index = i  # keep env state coherent for reach_slot_mask
-        visited.append(i)
-        time.sleep(ARRIVE_SLEEP)
+        for i in range(n_anchors):
+            ax, ay = float(anchors[i, 0]), float(anchors[i, 1])
+            target = Position(x=ax, y=ay)
+            print(f"-> anchor[{i}] ({ax:.1f},{ay:.1f})")
+            curr = _astar_walk(ns, inst, curr, target)
+            env._current_anchor_index = i  # keep env state coherent for reach_slot_mask
+            visited.append(i)
+            time.sleep(ARRIVE_SLEEP)
 
-        reachable_i = [j for j in range(n_slots) if reach[i, j]]
-        for j in reachable_i:
-            sx, sy = float(slots[j, 0]), float(slots[j, 1])  # TURRET coord, not anchor
-            turret = env._find_turret_at(sx, sy)
+            reachable_i = [j for j in range(n_slots) if reach[i, j]]
+            for j in reachable_i:
+                sx, sy = float(slots[j, 0]), float(slots[j, 1])  # TURRET coord, not anchor
+                turret = env._find_turret_at(sx, sy)
 
-            # Empty slot: place a turret here if we still have one in inventory.
-            if turret is None and turrets_left > 0 and j not in placed:
-                try:
-                    ns.place_entity(
-                        Prototype.GunTurret, Direction.UP, Position(x=sx, y=sy)
-                    )
-                    placed.add(j)
-                    turrets_left -= 1
-                    turret = env._find_turret_at(sx, sy)
-                    print(f"    placed turret in slot[{j}] ({sx:.1f},{sy:.1f})")
-                except Exception as e:
-                    print(f"    [place slot[{j}] failed: {e}]")
+                # Empty slot: place a turret here if we still have one in inventory.
+                if turret is None and turrets_left > 0 and j not in placed:
+                    try:
+                        ns.place_entity(
+                            Prototype.GunTurret, Direction.UP, Position(x=sx, y=sy)
+                        )
+                        placed.add(j)
+                        turrets_left -= 1
+                        turret = env._find_turret_at(sx, sy)
+                        print(f"    placed turret in slot[{j}] ({sx:.1f},{sy:.1f})")
+                    except Exception as e:
+                        print(f"    [place slot[{j}] failed: {e}]")
 
-            # Give ammo to whatever turret now occupies the slot.
-            if turret is not None:
-                try:
-                    ns.insert_item(Prototype.FirearmMagazine, turret, AMMO_PER)
-                    serviced.add(j)
-                    refill_events += 1
-                    ammo_inserted += AMMO_PER
-                except Exception as e:
-                    print(f"    [refill slot[{j}] failed: {e}]")
+                # Give ammo to whatever turret now occupies the slot.
+                if turret is not None:
+                    try:
+                        ns.insert_item(Prototype.FirearmMagazine, turret, AMMO_PER)
+                        serviced.add(j)
+                        refill_events += 1
+                        ammo_inserted += AMMO_PER
+                    except Exception as e:
+                        print(f"    [refill slot[{j}] failed: {e}]")
 
-    # -- 6. FINAL ASSERTIONS + SUMMARY ----------------------------------------
-    # Every anchor visited exactly once.
-    assert len(visited) == n_anchors, (
-        f"Visited {len(visited)} anchors, expected {n_anchors}"
-    )
+        # -- 6. FINAL ASSERTIONS + SUMMARY ------------------------------------
+        # Every anchor visited exactly once.
+        assert len(visited) == n_anchors, (
+            f"Visited {len(visited)} anchors, expected {n_anchors}"
+        )
 
-    # Every initially-empty slot was filled (all are reachable: orphans asserted
-    # out above, and inventory held exactly n_deleted turrets for n_deleted slots).
-    empty_slots = {j for j in range(n_slots) if obs["place_slot_mask"][j]}
-    assert placed == empty_slots, (
-        f"Empty slots not fully (re)placed. placed={sorted(placed)}, "
-        f"expected={sorted(empty_slots)}"
-    )
+        # Every initially-empty slot was filled (all are reachable: orphans asserted
+        # out above, and inventory held exactly n_deleted turrets for n_deleted slots).
+        empty_slots = {j for j in range(n_slots) if obs["place_slot_mask"][j]}
+        assert placed == empty_slots, (
+            f"Empty slots not fully (re)placed. placed={sorted(placed)}, "
+            f"expected={sorted(empty_slots)}"
+        )
 
-    # Every turret reachable from some anchor received ammo at least once.
-    all_reachable = {
-        j for j in range(n_slots) if any(reach[i, j] for i in range(n_anchors))
-    }
-    assert serviced == all_reachable, (
-        f"Some reachable turrets never got ammo. serviced={sorted(serviced)}, "
-        f"reachable={sorted(all_reachable)}"
-    )
+        # Every turret reachable from some anchor received ammo at least once.
+        all_reachable = {
+            j for j in range(n_slots) if any(reach[i, j] for i in range(n_anchors))
+        }
+        assert serviced == all_reachable, (
+            f"Some reachable turrets never got ammo. serviced={sorted(serviced)}, "
+            f"reachable={sorted(all_reachable)}"
+        )
 
-    # Inventory accounting: turret count dropped by exactly the number placed.
-    end_turrets = _inv_count(ns, "gun-turret")
-    assert end_turrets == start_turrets - len(placed), (
-        f"Turret inventory off: start={start_turrets}, end={end_turrets}, "
-        f"placed={len(placed)}"
-    )
+        # Inventory accounting: turret count dropped by exactly the number placed.
+        end_turrets = _inv_count(ns, "gun-turret")
+        assert end_turrets == start_turrets - len(placed), (
+            f"Turret inventory off: start={start_turrets}, end={end_turrets}, "
+            f"placed={len(placed)}"
+        )
 
-    # -- 6b. POLLUTE ENEMY STATE (simulate mid-episode expansion) -------------
-    # Add a nest and biters that did NOT exist at startup, mimicking biter
-    # expansion + spawning during an episode. reset() must rebuild the nest
-    # layout to exactly the starting set and clear all live biters.
-    n_nests_start = len(nests)
-    _spawn_enemy(inst, "biter-spawner", nests[0][0] + 16.0, nests[0][1] + 16.0)
-    _spawn_enemy(inst, "small-biter", 8.0, 8.0)
-    _spawn_enemy(inst, "small-biter", -8.0, 8.0)
-    time.sleep(0.5)
-    nests_polluted = _scan_nests(inst)
-    biters_polluted = _count_live_biters(inst)
-    assert len(nests_polluted) == n_nests_start + 1, (
-        f"Failed to add expansion nest: started {n_nests_start}, "
-        f"after pollute {len(nests_polluted)}"
-    )
-    assert biters_polluted >= 1, (
-        f"Failed to spawn test biters (got {biters_polluted}) — "
-        "cannot verify biter clearing on reset"
-    )
-    print(f"[pollute] nests {n_nests_start}->{len(nests_polluted)}, "
-          f"live biters {biters_polluted}")
+        # -- 6b. POLLUTE ENEMY STATE (simulate mid-episode expansion) ---------
+        # Add a nest and biters that did NOT exist at startup, mimicking biter
+        # expansion + spawning during an episode. reset() must rebuild the nest
+        # layout to exactly the starting set and clear all live biters.
+        n_nests_start = len(nests)
+        _spawn_enemy(inst, "biter-spawner", nests[0][0] + 16.0, nests[0][1] + 16.0)
+        _spawn_enemy(inst, "small-biter", 8.0, 8.0)
+        _spawn_enemy(inst, "small-biter", -8.0, 8.0)
+        time.sleep(0.5)
+        nests_polluted = _scan_nests(inst)
+        biters_polluted = _count_live_biters(inst)
+        assert len(nests_polluted) == n_nests_start + 1, (
+            f"Failed to add expansion nest: started {n_nests_start}, "
+            f"after pollute {len(nests_polluted)}"
+        )
+        assert biters_polluted >= 1, (
+            f"Failed to spawn test biters (got {biters_polluted}) — "
+            "cannot verify biter clearing on reset"
+        )
+        print(f"[pollute] nests {n_nests_start}->{len(nests_polluted)}, "
+              f"live biters {biters_polluted}")
 
-    # -- 7. RESET VERIFICATION ------------------------------------------------
-    # Simulate what the RL loop does when the episode ends (character dies or
-    # radar destroyed): wait a few seconds so the game advances, then call
-    # env.reset() and verify the state is fully restored from the snapshot:
-    # - Radar alive at original HP.
-    # - Turret slot count unchanged (layout read once from the map, never changes).
-    # - Deletion re-applied: the same fraction of slots emptied, turrets back in
-    #   the agent's inventory (the exact *which* slots changes because re-roll is
-    #   random, but the *counts* must be identical).
-    # - Character alive and near spawn.
-    # - Inventory ammo restored from starting_inventory config.
-    print("\n[reset] waiting 3s then calling env.reset() ...")
-    time.sleep(3.0)
+        # -- 7. RESET VERIFICATION --------------------------------------------
+        # Simulate what the RL loop does when the episode ends (character dies or
+        # radar destroyed): wait a few seconds so the game advances, then call
+        # env.reset() and verify the state is fully restored from the snapshot:
+        # - Radar alive at original HP.
+        # - Turret slot count unchanged (layout read once from the map, never changes).
+        # - Deletion re-applied: the same fraction of slots emptied, turrets back in
+        #   the agent's inventory (the exact *which* slots changes because re-roll is
+        #   random, but the *counts* must be identical).
+        # - Character alive and near spawn.
+        # - Inventory ammo restored from starting_inventory config.
+        # - Nests restored to starting set; all live biters cleared.
+        print("\n[reset] waiting 3s then calling env.reset() ...")
+        time.sleep(3.0)
 
-    obs2, info2 = env.reset()
+        obs2, info2 = env.reset()
 
-    assert obs2["radar"][2] > 0, (
-        f"Radar HP is zero after reset: {obs2['radar'][2]:.1f}"
-    )
-    assert abs(float(obs2["radar"][2]) - float(obs["radar"][2])) < 5.0, (
-        f"Radar HP diverged between episodes: "
-        f"ep1={obs['radar'][2]:.1f}, ep2={obs2['radar'][2]:.1f}"
-    )
+        assert obs2["radar"][2] > 0, (
+            f"Radar HP is zero after reset: {obs2['radar'][2]:.1f}"
+        )
+        assert abs(float(obs2["radar"][2]) - float(obs["radar"][2])) < 5.0, (
+            f"Radar HP diverged between episodes: "
+            f"ep1={obs['radar'][2]:.1f}, ep2={obs2['radar'][2]:.1f}"
+        )
 
-    n_slots_after = int(obs2["slot_valid_mask"].sum())
-    assert n_slots_after == n_slots, (
-        f"Turret slot count changed after reset: {n_slots} -> {n_slots_after}"
-    )
+        n_slots_after = int(obs2["slot_valid_mask"].sum())
+        assert n_slots_after == n_slots, (
+            f"Turret slot count changed after reset: {n_slots} -> {n_slots_after}"
+        )
 
-    n_empty_after = int(obs2["place_slot_mask"].sum())
-    assert n_empty_after == n_deleted, (
-        f"After reset, expected {n_deleted} empty slots (deletion re-rolled), "
-        f"found {n_empty_after}"
-    )
+        n_empty_after = int(obs2["place_slot_mask"].sum())
+        assert n_empty_after == n_deleted, (
+            f"After reset, expected {n_deleted} empty slots (deletion re-rolled), "
+            f"found {n_empty_after}"
+        )
 
-    turrets_after_reset = _inv_count(ns, "gun-turret")
-    assert turrets_after_reset == n_deleted, (
-        f"After reset, expected {n_deleted} gun-turrets in inventory, "
-        f"found {turrets_after_reset}"
-    )
+        turrets_after_reset = _inv_count(ns, "gun-turret")
+        assert turrets_after_reset == n_deleted, (
+            f"After reset, expected {n_deleted} gun-turrets in inventory, "
+            f"found {turrets_after_reset}"
+        )
 
-    assert obs2["character"][2] > 0, "Character HP is zero after reset"
-    spawn_x, spawn_y = cfg.player_spawn_position
-    # obs character coords are radar-relative + normalized; de-normalize to world.
-    cx2 = float(obs2["character"][0]) * env._norm + env._center_x
-    cy2 = float(obs2["character"][1]) * env._norm + env._center_y
-    assert abs(cx2 - spawn_x) < 2.0 and abs(cy2 - spawn_y) < 2.0, (
-        f"Character not at spawn after reset: ({cx2:.1f},{cy2:.1f}), "
-        f"expected near ({spawn_x},{spawn_y})"
-    )
+        assert obs2["character"][2] > 0, "Character HP is zero after reset"
+        spawn_x, spawn_y = cfg.player_spawn_position
+        # obs character coords are radar-relative + normalized; de-normalize to world.
+        cx2 = float(obs2["character"][0]) * env._norm + env._center_x
+        cy2 = float(obs2["character"][1]) * env._norm + env._center_y
+        assert abs(cx2 - spawn_x) < 2.0 and abs(cy2 - spawn_y) < 2.0, (
+            f"Character not at spawn after reset: ({cx2:.1f},{cy2:.1f}), "
+            f"expected near ({spawn_x},{spawn_y})"
+        )
 
-    ammo_after_reset = int(obs2["inventory"][ammo_idx])
-    assert ammo_after_reset > 0, "Agent has no ammo after reset"
+        ammo_after_reset = int(obs2["inventory"][ammo_idx])
+        assert ammo_after_reset > 0, "Agent has no ammo after reset"
 
-    # Enemy nest layout rebuilt to the starting set (expansion nest removed),
-    # and all live biters cleared.
-    nests_after_reset = _scan_nests(inst)
-    assert len(nests_after_reset) == n_nests_start, (
-        f"Nest layout not restored after reset: started {n_nests_start}, "
-        f"polluted to {len(nests_polluted)}, after reset {len(nests_after_reset)}"
-    )
-    biters_after_reset = _count_live_biters(inst)
-    assert biters_after_reset == 0, (
-        f"Live biters remain after reset: {biters_after_reset} "
-        "(expected 0 — stale biters should be cleared)"
-    )
-    print(f"[reset] nests {len(nests_polluted)}->{len(nests_after_reset)} "
-          f"(start {n_nests_start}), biters {biters_polluted}->{biters_after_reset}")
+        # Enemy nest layout rebuilt to the starting set (expansion nest removed),
+        # and all live biters cleared.
+        nests_after_reset = _scan_nests(inst)
+        assert len(nests_after_reset) == n_nests_start, (
+            f"Nest layout not restored after reset: started {n_nests_start}, "
+            f"polluted to {len(nests_polluted)}, after reset {len(nests_after_reset)}"
+        )
+        biters_after_reset = _count_live_biters(inst)
+        assert biters_after_reset == 0, (
+            f"Live biters remain after reset: {biters_after_reset} "
+            "(expected 0 — stale biters should be cleared)"
+        )
+        print(f"[reset] nests {len(nests_polluted)}->{len(nests_after_reset)} "
+              f"(start {n_nests_start}), biters {biters_polluted}->{biters_after_reset}")
 
-    print(
-        f"[reset] PASS — radar={obs2['radar'][2]:.0f}HP, "
-        f"slots={n_slots_after} ({n_empty_after} empty), "
-        f"turrets_in_inv={turrets_after_reset}, "
-        f"ammo={ammo_after_reset}, "
-        f"char_HP={obs2['character'][2]:.0f}"
-    )
+        print(
+            f"[reset] PASS — radar={obs2['radar'][2]:.0f}HP, "
+            f"slots={n_slots_after} ({n_empty_after} empty), "
+            f"turrets_in_inv={turrets_after_reset}, "
+            f"ammo={ammo_after_reset}, "
+            f"char_HP={obs2['character'][2]:.0f}"
+        )
 
-    # -- 8. SECOND WALK (post-reset) ------------------------------------------
-    # Verify the reset→walk loop works end-to-end and measure how long a full
-    # pass takes. The reach matrix is the same (static), but deletion re-rolled
-    # so the set of empty slots may differ from episode 1. Character starts at
-    # spawn (where reset() left it).
-    print("\n[walk2] starting second anchor walk after reset ...")
-    t_walk2_start = time.time()
+        # -- 8. SECOND WALK (post-reset) --------------------------------------
+        # Verify the reset→walk loop works end-to-end and measure how long a full
+        # pass takes. The reach matrix is the same (static), but deletion re-rolled
+        # so the set of empty slots may differ from episode 1. Character starts at
+        # spawn (where reset() left it).
+        print("\n[walk2] starting second anchor walk after reset ...")
+        t_walk2_start = time.time()
 
-    placed2: set = set()
-    serviced2: set = set()
-    visited2: list = []
-    turrets_left2 = turrets_after_reset
-    refill_events2 = 0
-    ammo_inserted2 = 0
-    empty_slots2 = {j for j in range(n_slots) if obs2["place_slot_mask"][j]}
+        placed2: set = set()
+        serviced2: set = set()
+        visited2: list = []
+        turrets_left2 = turrets_after_reset
+        refill_events2 = 0
+        ammo_inserted2 = 0
+        empty_slots2 = {j for j in range(n_slots) if obs2["place_slot_mask"][j]}
 
-    # Same biter isolation as walk 1 (reset() recreated the nests active).
-    _set_nests_active(inst, False)
-    env._clear_live_biters()
-    inst.unpause()  # reset() pauses; unpause so A* and glide work
-    spawn_x2, spawn_y2 = cfg.player_spawn_position
-    curr2 = Position(x=spawn_x2, y=spawn_y2)
+        # Biter isolation for walk 2: env.reset() recreated the nests as active;
+        # disable them again so biters don't destroy turrets mid-walk.
+        # The finally block below guarantees they are re-enabled on exit.
+        _set_nests_active(inst, False)
+        env._clear_live_biters()
+        inst.unpause()  # reset() pauses; unpause so A* and glide work
+        spawn_x2, spawn_y2 = cfg.player_spawn_position
+        curr2 = Position(x=spawn_x2, y=spawn_y2)
 
-    for i in range(n_anchors):
-        ax, ay = float(anchors[i, 0]), float(anchors[i, 1])
-        target2 = Position(x=ax, y=ay)
-        print(f"-> [walk2] anchor[{i}] ({ax:.1f},{ay:.1f})")
-        curr2 = _astar_walk(ns, inst, curr2, target2)
-        env._current_anchor_index = i
-        visited2.append(i)
-        time.sleep(ARRIVE_SLEEP)
+        for i in range(n_anchors):
+            ax, ay = float(anchors[i, 0]), float(anchors[i, 1])
+            target2 = Position(x=ax, y=ay)
+            print(f"-> [walk2] anchor[{i}] ({ax:.1f},{ay:.1f})")
+            curr2 = _astar_walk(ns, inst, curr2, target2)
+            env._current_anchor_index = i
+            visited2.append(i)
+            time.sleep(ARRIVE_SLEEP)
 
-        reachable_i = [j for j in range(n_slots) if reach[i, j]]
-        for j in reachable_i:
-            sx, sy = float(slots[j, 0]), float(slots[j, 1])
-            turret2 = env._find_turret_at(sx, sy)
+            reachable_i = [j for j in range(n_slots) if reach[i, j]]
+            for j in reachable_i:
+                sx, sy = float(slots[j, 0]), float(slots[j, 1])
+                turret2 = env._find_turret_at(sx, sy)
 
-            if turret2 is None and turrets_left2 > 0 and j not in placed2:
-                try:
-                    ns.place_entity(
-                        Prototype.GunTurret, Direction.UP, Position(x=sx, y=sy)
-                    )
-                    placed2.add(j)
-                    turrets_left2 -= 1
-                    turret2 = env._find_turret_at(sx, sy)
-                    print(f"    [walk2] placed turret in slot[{j}] ({sx:.1f},{sy:.1f})")
-                except Exception as e:
-                    print(f"    [walk2] place slot[{j}] failed: {e}")
+                if turret2 is None and turrets_left2 > 0 and j not in placed2:
+                    try:
+                        ns.place_entity(
+                            Prototype.GunTurret, Direction.UP, Position(x=sx, y=sy)
+                        )
+                        placed2.add(j)
+                        turrets_left2 -= 1
+                        turret2 = env._find_turret_at(sx, sy)
+                        print(f"    [walk2] placed turret in slot[{j}] ({sx:.1f},{sy:.1f})")
+                    except Exception as e:
+                        print(f"    [walk2] place slot[{j}] failed: {e}")
 
-            if turret2 is not None:
-                try:
-                    ns.insert_item(Prototype.FirearmMagazine, turret2, AMMO_PER)
-                    serviced2.add(j)
-                    refill_events2 += 1
-                    ammo_inserted2 += AMMO_PER
-                except Exception as e:
-                    print(f"    [walk2] refill slot[{j}] failed: {e}")
+                if turret2 is not None:
+                    try:
+                        ns.insert_item(Prototype.FirearmMagazine, turret2, AMMO_PER)
+                        serviced2.add(j)
+                        refill_events2 += 1
+                        ammo_inserted2 += AMMO_PER
+                    except Exception as e:
+                        print(f"    [walk2] refill slot[{j}] failed: {e}")
 
-    t_walk2_elapsed = time.time() - t_walk2_start
+        t_walk2_elapsed = time.time() - t_walk2_start
 
-    # Walk 2 must cover all anchors and all reachable empty slots.
-    assert len(visited2) == n_anchors, (
-        f"[walk2] visited {len(visited2)} anchors, expected {n_anchors}"
-    )
-    assert placed2 == empty_slots2, (
-        f"[walk2] empty slots not fully refilled. placed={sorted(placed2)}, "
-        f"expected={sorted(empty_slots2)}"
-    )
-    assert serviced2 == all_reachable, (
-        f"[walk2] not all reachable turrets got ammo. serviced={sorted(serviced2)}, "
-        f"reachable={sorted(all_reachable)}"
-    )
+        # Walk 2 must cover all anchors and all reachable empty slots.
+        assert len(visited2) == n_anchors, (
+            f"[walk2] visited {len(visited2)} anchors, expected {n_anchors}"
+        )
+        assert placed2 == empty_slots2, (
+            f"[walk2] empty slots not fully refilled. placed={sorted(placed2)}, "
+            f"expected={sorted(empty_slots2)}"
+        )
+        assert serviced2 == all_reachable, (
+            f"[walk2] not all reachable turrets got ammo. serviced={sorted(serviced2)}, "
+            f"reachable={sorted(all_reachable)}"
+        )
 
-    end_turrets2 = _inv_count(ns, "gun-turret")
-    assert end_turrets2 == turrets_after_reset - len(placed2), (
-        f"[walk2] turret inventory off: start={turrets_after_reset}, "
-        f"end={end_turrets2}, placed={len(placed2)}"
-    )
+        end_turrets2 = _inv_count(ns, "gun-turret")
+        assert end_turrets2 == turrets_after_reset - len(placed2), (
+            f"[walk2] turret inventory off: start={turrets_after_reset}, "
+            f"end={end_turrets2}, placed={len(placed2)}"
+        )
 
-    print(f"[walk2] done in {t_walk2_elapsed:.1f}s")
+        print(f"[walk2] done in {t_walk2_elapsed:.1f}s")
 
-    print(
-        "\n=== FULL INTEGRATION SUMMARY ===\n"
-        f"  anchors visited     : {len(visited)}/{n_anchors} (ep1) | "
-        f"{len(visited2)}/{n_anchors} (ep2)\n"
-        f"  turret slots        : {n_slots} ({n_deleted} started empty)\n"
-        f"  biter nests         : {len(nests)}\n"
-        f"  ep1 placed/serviced : {len(placed)}/{len(all_reachable)} | "
-        f"refills={refill_events} ({ammo_inserted} mags)\n"
-        f"  ep2 placed/serviced : {len(placed2)}/{len(all_reachable)} | "
-        f"refills={refill_events2} ({ammo_inserted2} mags)\n"
-        f"  ep2 walk time       : {t_walk2_elapsed:.1f}s\n"
-        f"  gun-turret inventory: {start_turrets} (ep1 start) -> "
-        f"{end_turrets} (ep1 end) -> {turrets_after_reset} (reset) -> "
-        f"{end_turrets2} (ep2 end)\n"
-        "================================"
-    )
+        print(
+            "\n=== FULL INTEGRATION SUMMARY ===\n"
+            f"  anchors visited     : {len(visited)}/{n_anchors} (ep1) | "
+            f"{len(visited2)}/{n_anchors} (ep2)\n"
+            f"  turret slots        : {n_slots} ({n_deleted} started empty)\n"
+            f"  biter nests         : {len(nests)}\n"
+            f"  ep1 placed/serviced : {len(placed)}/{len(all_reachable)} | "
+            f"refills={refill_events} ({ammo_inserted} mags)\n"
+            f"  ep2 placed/serviced : {len(placed2)}/{len(all_reachable)} | "
+            f"refills={refill_events2} ({ammo_inserted2} mags)\n"
+            f"  ep2 walk time       : {t_walk2_elapsed:.1f}s\n"
+            f"  gun-turret inventory: {start_turrets} (ep1 start) -> "
+            f"{end_turrets} (ep1 end) -> {turrets_after_reset} (reset) -> "
+            f"{end_turrets2} (ep2 end)\n"
+            "================================"
+        )
+
+    finally:
+        # Always re-enable spawners so the container is left in a live state
+        # for subsequent runs (training, other tests) regardless of pass/fail.
+        _set_nests_active(inst, True)
+        print("[cleanup] enemy spawners re-enabled")

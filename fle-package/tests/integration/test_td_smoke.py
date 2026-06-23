@@ -13,6 +13,18 @@ import numpy as np
 import pytest
 
 
+def _char_pos(env):
+    raw = env.instance.rcon_client.send_command(
+        "/sc local c=storage.agent_characters and storage.agent_characters[1]; "
+        "if c and c.valid then rcon.print(c.position.x..','..c.position.y) "
+        "else rcon.print('nil') end"
+    ).strip()
+    if not raw or raw == "nil":
+        pytest.skip("No agent character available to inspect.")
+    x, y = raw.split(",")
+    return float(x), float(y)
+
+
 class TestTowerDefenseSmoke:
     """Smoke tests that require a live Factorio server."""
 
@@ -20,17 +32,7 @@ class TestTowerDefenseSmoke:
         """reset() returns an obs dict with correct keys, shapes, and dtypes."""
         obs, info = td_env.reset()
 
-        expected_keys = {
-            "map",
-            "inventory",
-            "turret_slots",
-            "slot_valid_mask",
-            "place_slot_mask",
-            "refill_slot_mask",
-            "character",
-            "radar",
-            "game",
-        }
+        expected_keys = set(td_env.observation_space.spaces)
         assert set(obs.keys()) == expected_keys
 
         space = td_env.observation_space
@@ -93,6 +95,54 @@ class TestTowerDefenseSmoke:
                 break
 
         assert obs["game"][0] > initial_ticks, "Elapsed ticks did not increase after steps"
+
+    def test_move_anchor_moves_character_and_finishes(self, td_env):
+        """MOVE_ANCHOR advances the live character and eventually clears is_moving."""
+        from fle.env.gym_env.td_spaces import ACTION_MOVE_ANCHOR, ACTION_NOOP
+
+        td_env.reset()
+        anchors = td_env.unwrapped._anchor_slots
+        if anchors is None or len(anchors) == 0:
+            pytest.skip("Map has no anchor slots.")
+
+        sx, sy = _char_pos(td_env)
+        distances = np.hypot(anchors[:, 0] - sx, anchors[:, 1] - sy)
+        target = int(np.argmax(distances))
+        if float(distances[target]) <= 0.5:
+            pytest.skip("No anchor far enough from the current character position.")
+
+        move = {
+            "action_type": ACTION_MOVE_ANCHOR,
+            "slot_index": 0,
+            "ammo_amount": 0,
+            "anchor_index": target,
+        }
+        _, _, terminated, truncated, info = td_env.step(move)
+        if terminated or truncated:
+            pytest.skip("Episode ended during MOVE_ANCHOR step.")
+        assert not info.get("invalid_action", False)
+
+        mx, my = _char_pos(td_env)
+        assert math.hypot(mx - sx, my - sy) > 0.5, "character did not move after MOVE_ANCHOR"
+
+        noop = {
+            "action_type": ACTION_NOOP,
+            "slot_index": 0,
+            "ammo_amount": 0,
+            "anchor_index": 0,
+        }
+        last_info = info
+        for _ in range(20):
+            if not last_info.get("is_moving", False):
+                break
+            _, _, terminated, truncated, last_info = td_env.step(noop)
+            if terminated or truncated:
+                pytest.skip("Episode ended while waiting for anchor movement to finish.")
+
+        assert not last_info.get("is_moving", False), "MOVE_ANCHOR stayed active"
+        fx, fy = _char_pos(td_env)
+        tx, ty = float(anchors[target, 0]), float(anchors[target, 1])
+        assert math.hypot(fx - tx, fy - ty) <= 1.0
 
     def test_reset_is_idempotent(self, td_env):
         """Calling reset() twice returns obs with the same shapes both times."""
