@@ -3,7 +3,7 @@ if not storage.clearance_entities then
     storage.clearance_entities = {}
 end
 
-storage.actions.request_path = function(player_index, start_x, start_y, goal_x, goal_y, radius, allow_paths_through_own_entities, entity_size)
+storage.actions.request_path = function(player_index, start_x, start_y, goal_x, goal_y, radius, allow_paths_through_own_entities, entity_size, resolution)
     -- Ensure we have a valid character, recreating if necessary
     local player = storage.utils.ensure_valid_character(player_index)
     if not player then return nil end

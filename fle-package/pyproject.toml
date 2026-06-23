@@ -44,6 +44,9 @@ dependencies = [
     "matplotlib>=3.10.7",
     "platformdirs>=4.0.0",
     "pyyaml>=6.0.0",
+    "stable-baselines3>=2.9.0",
+    "sb3-contrib>=2.9.0",
+    "tensorboard>=2.20.0",
 ]
 
 [project.optional-dependencies]
@@ -89,6 +92,9 @@ packages = ["fle"]
 pythonpath = "fle/env"
 testpaths = "tests"
 python_files = "test_*.py"
+markers = [
+    "integration: marks tests as requiring a live Factorio server (deselect with -m 'not integration')",
+]
 
 [project.urls]
 homepage = "https://jackhopkins.github.io/factorio-learning-environment/"

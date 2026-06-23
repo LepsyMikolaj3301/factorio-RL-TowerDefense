@@ -24,23 +24,26 @@ class TowerDefenseTask(TaskABC):
     - Failure if radar or character is destroyed
     """
 
+    _DEFAULT_INVENTORY = {
+        "firearm-magazine": 100,
+        "stone-wall": 50,
+        "gun-turret": 5,
+        "piercing-rounds-magazine": 50,
+        "pistol": 1,
+    }
+
     def __init__(
         self,
         trajectory_length: int = 1800,  # 30 minutes of game time at 60 ticks/sec
         task_key: str = "tower_defense",
         goal_description: str = "Defend the radar from biter waves using walls, turrets, and shooting.",
         radar_position: Optional[Position] = None,
-        starting_ammo: int = 100,
-        starting_walls: int = 50,
-        starting_turrets: int = 5,
+        starting_inventory_dict: Optional[Dict] = None,
     ):
-        starting_inventory = Inventory(**{
-            "firearm-magazine": starting_ammo,
-            "stone-wall": starting_walls,
-            "gun-turret": starting_turrets,
-            "piercing-rounds-magazine": 50,
-            "pistol": 1,
-        })
+        inv_dict = dict(starting_inventory_dict) if starting_inventory_dict else dict(self._DEFAULT_INVENTORY)
+        # Ensure pistol is always present for the player to shoot with
+        inv_dict.setdefault("pistol", 1)
+        starting_inventory = Inventory(**inv_dict)
 
         super().__init__(
             trajectory_length=trajectory_length,
@@ -51,19 +54,27 @@ class TowerDefenseTask(TaskABC):
         )
 
         self.radar_position = radar_position or Position(x=0, y=0)
-        self.starting_ammo = starting_ammo
-        self.starting_walls = starting_walls
-        self.starting_turrets = starting_turrets
 
     def setup_instance(self, instance: FactorioInstance):
+        """Place the radar at the player spawn, moving the player clear first."""
+        ns = instance.first_namespace
+
         # Anchor radar to player spawn position
         try:
-            loc = instance.first_namespace.player_location
+            loc = ns.player_location
             self.radar_position = Position(x=float(loc.x), y=float(loc.y))
         except Exception:
             pass
-        """Place radar at the center position."""
-        ns = instance.first_namespace
+
+        # The character stands on the spawn tile, but the radar is a 3x3 entity
+        # that would collide with the player and fail to place. Move the character
+        # clear of the radar footprint before placing it.
+        try:
+            ns.move_to(
+                Position(x=self.radar_position.x + 4.0, y=self.radar_position.y)
+            )
+        except Exception as e:
+            print(f"Warning: Could not move character clear of radar: {e}")
 
         # Place the radar
         try:
@@ -72,7 +83,7 @@ class TowerDefenseTask(TaskABC):
                 position=self.radar_position,
             )
         except Exception as e:
-            print(f"Warning: Could not place radar: {e}")
+            print(f"Error: Could not place radar at {self.radar_position}: {e}")
 
     def verify(
         self,

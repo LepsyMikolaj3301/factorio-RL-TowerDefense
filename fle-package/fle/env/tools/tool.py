@@ -42,9 +42,4 @@ class Tool(Controller):
             return response
 
     def load(self):
-        # self.lua_script_manager.load_action_into_game(self.name)
         self.lua_script_manager.load_tool_into_game(self.name)
-        # script = _load_action(self.name)
-        # if not script:
-        #     raise Exception(f"Could not load {self.name}")
-        # self.connection.send_command(f'{COMMAND} '+script)

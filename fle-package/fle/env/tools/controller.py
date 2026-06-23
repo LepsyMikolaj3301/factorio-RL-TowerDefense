@@ -82,12 +82,12 @@ class Controller:
 
         cleaned_response = {}
 
+        # Scalars / strings (e.g. radar_view's base64 grid, spawn_enemy's count)
+        # have no .items(); pass them through unchanged.
         if not hasattr(response, "items"):
-            pass
+            return response
 
         for key, value in response.items():
-            # if key == 'status' and isinstance(value, str):
-            # cleaned_response[key] = EntityStatus.from_string(value)
             if key == "direction":
                 if isinstance(value, str):
                     cleaned_response[key] = Direction.from_string(value)
@@ -279,7 +279,6 @@ class Controller:
                 return parts[1][:-2], -1
             except IndexError:
                 return e.args[0], -1
-            # return lua_response, -1
         except TypeError:
             return lua_response, -1
         except Exception:
@@ -290,5 +289,4 @@ class Controller:
         start = timer()
         script = self._get_command(command, parameters=list(parameters), measured=False)
         lua_response = self.connection.send_command(script)
-        # print(lua_response)
         return _lua2python(command, lua_response, start=start)

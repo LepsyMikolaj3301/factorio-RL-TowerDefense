@@ -5,16 +5,13 @@ import numpy as np
 from pydantic import ConfigDict, BaseModel, Field
 
 from fle.commons.models.timing_metrics import TimingMetrics
-
 from fle.commons.models.achievements import ProductionFlows
-from fle.commons.models.conversation import Conversation
 from fle.commons.models.game_state import GameState
 
 
 class Program(BaseModel):
     id: Optional[int] = None
     code: str
-    conversation: Conversation
     value: float = 0.0
     visits: int = 0
     parent_id: Optional[int] = None
@@ -22,13 +19,9 @@ class Program(BaseModel):
     raw_reward: Optional[float] = None
     holdout_value: Optional[float] = None
     created_at: datetime = Field(default_factory=datetime.now)
-    prompt_token_usage: Optional[int] = None
-    completion_token_usage: Optional[int] = None
-    token_usage: Optional[int] = None
-    response: Optional[str] = None
     version: int = 1
     version_description: Optional[str] = ""
-    model: str = "gpt-4o"
+    model: str = ""
     meta: dict = {}
     achievements: dict = {}
     instance: int = -1
@@ -58,7 +51,6 @@ class Program(BaseModel):
         return cls(
             id=row["id"],
             code=row["code"],
-            conversation=Conversation.parse_raw(row["conversation_json"]),
             value=row["value"],
             visits=row["visits"],
             parent_id=row["parent_id"],
@@ -66,12 +58,9 @@ class Program(BaseModel):
             raw_reward=row["raw_reward"],
             holdout_value=row["holdout_value"],
             created_at=row["created_at"],
-            prompt_token_usage=row["prompt_token_usage"],
-            completion_token_usage=row["completion_token_usage"],
-            token_usage=row["token_usage"],
-            response=row["response"],
             version=row["version"],
             version_description=row["version_description"],
+            model=row.get("model", ""),
             meta=row["meta"] if row["meta"] else {},
             achievements=row["achievements_json"] if row["achievements_json"] else {},
             instance=row["instance"],

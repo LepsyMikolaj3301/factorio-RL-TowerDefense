@@ -25,9 +25,3 @@ class Reward(Tool):
             response["player"] = 0
 
         return response["player"], goal
-
-
-# if __name__ == "__main__":
-#     score = Reward("connection", 0)
-#     score.load()
-#     pass

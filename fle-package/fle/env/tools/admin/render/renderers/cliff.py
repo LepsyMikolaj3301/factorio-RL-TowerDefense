@@ -153,17 +153,6 @@ def get_cliff_sprite_name(cliff_type: str, orientation: str) -> str:
     # Get the mapping with fallback
     row = orientation_map.get(orientation, 1)
 
-    # # Ensure we stay within bounds for each cliff type
-    # if cliff_type == 'cliff-inner' and row > 2:
-    #     row = 2
-    # elif cliff_type == 'cliff-outer' and row > 2:
-    #     row = 2
-    # elif cliff_type == 'cliff-entrance' and (col > 4 or row > 4):
-    #     col = min(col, 4)
-    #     row = min(row, 4)
-    # elif cliff_type == 'cliff-sides' and row > 4:
-    #     row = 4
-
     variant = random.choice([1, 2, 3, 4])
     return f"{cliff_type}_{variant}_{row}"
 

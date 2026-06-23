@@ -38,9 +38,6 @@ def flatten_entities(
 
     for entity in entities:
         if isinstance(entity, dict):
-            # if entity["name"] == "character":
-            #    continue
-
             try:
                 # Sigh. Some blueprints are 0-12.
                 entity["direction"] = (
@@ -66,9 +63,6 @@ def flatten_entities(
             for e in e_list:
                 yield e
         else:
-            # if entity.name == "character":
-            #    continue
-
             yield entity
 
 

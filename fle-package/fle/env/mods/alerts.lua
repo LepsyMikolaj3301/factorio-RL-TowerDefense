@@ -370,8 +370,7 @@ function round_to_half(number)
 end
 
 
--- Define a function to be called every tick
-local function on_tick(event)
+storage.actions.update_alerts = function(event)
     -- Run the check every 60 ticks (1 second)
     if event.tick % 60 == 0 then
         for _, surface in pairs(game.surfaces) do
@@ -411,6 +410,3 @@ storage.get_alerts = function(seconds)
 
     return old_alerts
 end
-
--- Register the on_tick function to the on_tick event
-script.on_event(defines.events.on_tick, on_tick)

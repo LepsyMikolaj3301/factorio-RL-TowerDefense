@@ -413,38 +413,6 @@ class Renderer:
             )
         )
 
-    # @profile_method()
-    # def get_size(self) -> Dict:
-    #     """Calculate blueprint bounds including resources and trees."""
-    #     bounds = self._calculate_bounds()
-    #
-    #     # Calculate actual content dimensions (not including origin distance)
-    #     content_width = bounds['max_width'] - bounds['min_width']
-    #     content_height = bounds['max_height'] - bounds['min_height']
-    #
-    #     # Make dimensions square by using the minimum
-    #     min_dimension = min(content_width, content_height)
-    #
-    #     # Calculate how much to crop from each direction
-    #     width_diff = content_width - min_dimension
-    #     height_diff = content_height - min_dimension
-    #
-    #     # Crop bounds to create a square area
-    #     # Split the difference evenly on both sides
-    #     adjusted_min_x = bounds['min_width'] + width_diff / 2
-    #     adjusted_max_x = bounds['max_width'] - width_diff / 2
-    #     adjusted_min_y = bounds['min_height'] + height_diff / 2
-    #     adjusted_max_y = bounds['max_height'] - height_diff / 2
-    #
-    #     return {
-    #         'minX': adjusted_min_x,
-    #         'minY': adjusted_min_y,
-    #         'maxX': adjusted_max_x,
-    #         'maxY': adjusted_max_y,
-    #         'width': math.ceil(min_dimension),
-    #         'height': math.ceil(min_dimension)
-    #     }
-
     def _get_position(self, item: Any) -> Optional[Dict[str, float]]:
         """Extract position from an item, handling both dict and object formats.
 
@@ -542,51 +510,6 @@ class Renderer:
                 normalized.append(copy.deepcopy(item))
 
         return normalized
-
-    # def _calculate_bounds(self) -> Dict:
-    #     """Calculate the bounding box for all entities and resources."""
-    #     min_width = min_height = 0
-    #     max_width = max_height = 0
-    #
-    #     # Check entities
-    #     for entity in self.entities:
-    #         pos = entity.position
-    #         size = renderer_manager.get_entity_size(entity)
-    #         min_width = min(min_width, pos.x - size[0] / 2)
-    #         min_height = min(min_height, pos.y - size[1] / 2)
-    #         max_width = max(max_width, pos.x + size[0] / 2)
-    #         max_height = max(max_height, pos.y + size[1] / 2)
-    #
-    #     # Check resources (they are 1x1)
-    #     for resource in self.resources:
-    #         pos = resource['position']
-    #         min_width = min(min_width, pos['x'] - 0.5)
-    #         min_height = min(min_height, pos['y'] - 0.5)
-    #         max_width = max(max_width, pos['x'] + 0.5)
-    #         max_height = max(max_height, pos['y'] + 0.5)
-    #
-    #     # Check water tiles (they are 1x1)
-    #     for water_tile in self.water_tiles:
-    #         pos = water_tile
-    #         min_width = min(min_width, pos['x'] - 0.5)
-    #         min_height = min(min_height, pos['y'] - 0.5)
-    #         max_width = max(max_width, pos['x'] + 0.5)
-    #         max_height = max(max_height, pos['y'] + 0.5)
-    #
-    #     # If max_render_radius is specified, limit the bounds
-    #     if self.max_render_radius is not None:
-    #         # Assume we're centered at (0, 0) after normalization
-    #         min_width = max(min_width, -self.max_render_radius)
-    #         min_height = max(min_height, -self.max_render_radius)
-    #         max_width = min(max_width, self.max_render_radius)
-    #         max_height = min(max_height, self.max_render_radius)
-    #
-    #     return {
-    #         'min_width': min_width,
-    #         'min_height': min_height,
-    #         'max_width': max_width,
-    #         'max_height': max_height
-    #     }
 
     @profile_method(include_args=True)
     def render(self, width: int, height: int, image_resolver) -> Image.Image:

@@ -6,7 +6,6 @@ from fle.env.tools import Tool
 
 class PlaceEntityNextTo(Tool):
     def __init__(self, connection, game_state):
-        # self.game_state = game_state
         super().__init__(connection, game_state)
 
     def __call__(
@@ -52,16 +51,7 @@ class PlaceEntityNextTo(Tool):
 
             cleaned_response = self.clean_response(response)
 
-            # Extract and log smart placement feedback
             placement_feedback = cleaned_response.pop("placement_feedback", None)
-            if placement_feedback:
-                feedback_msg = (
-                    f"Placement feedback for {name}: {placement_feedback['reason']}"
-                )
-                if placement_feedback.get("auto_oriented"):
-                    feedback_msg += " (Auto-oriented for optimal flow)"
-                # Could log this or store it for agent learning
-                # print(feedback_msg)
 
             try:
                 object = metaclass(

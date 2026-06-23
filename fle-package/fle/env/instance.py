@@ -228,9 +228,7 @@ class FactorioInstance:
         self.initial_score = 0
         try:
             self.first_namespace.score()
-            # print("Initial score:", self.initial_score)
         except Exception:
-            # print(e)
             # Invalidate cache if there is an error
             self.lua_script_manager = LuaScriptManager(self.rcon_client, False)
             self.script_dict = {
@@ -375,10 +373,6 @@ class FactorioInstance:
         try:
             rcon_client.connect()
             rcon_client.send_command("/sc rcon.print(#game.players)")
-            # if int(player_count) == 0:
-            #     print(
-            #         "WARNING: LuaPlayer hasn't been initialised into the game. Entity placement behavior _may_ be incorrect for boilers and pumps."
-            #     )
 
         except Exception as e:
             raise ConnectionError(
@@ -387,6 +381,62 @@ class FactorioInstance:
 
         print(f"Connected to {address} client at tcp/{tcp_port}.")
         return rcon_client, address
+
+    def reconnect_rcon(
+        self,
+        pause_after: bool = True,
+        wait: float = 3.0,
+        retries: int = 5,
+    ) -> None:
+        """Re-establish the RCON connection after a drop.
+
+        Factorio closes RCON connections briefly when a human client joins
+        (map sync stalls the networking layer). This patches all three handles
+        that hold a reference to the socket:
+          - self.rcon_client          (direct callers)
+          - self.lua_script_manager.rcon_client  (tool calls via namespace)
+          - self.game_control.rcon_client        (pause/unpause/speed)
+
+        If pause_after is True (the default) the game is paused immediately
+        after reconnecting to minimise the extra ticks that elapsed while the
+        connection was down. Callers that care about elapsed time should re-read
+        get_elapsed_ticks() after this call.
+
+        Raises RuntimeError if all retries are exhausted.
+        """
+        import logging
+        log = logging.getLogger(__name__)
+
+        for attempt in range(1, retries + 1):
+            time.sleep(wait)
+            try:
+                new_client = RCONClient(self.address, self.tcp_port, RCON_PASSWORD)
+                new_client.connect()
+                new_client.send_command("/sc rcon.print('reconnected')")
+
+                self.rcon_client = new_client
+                self.lua_script_manager.rcon_client = new_client
+                self.game_control.rcon_client = new_client
+
+                if pause_after:
+                    new_client.send_command("/sc game.tick_paused = true")
+                    self.game_control._is_paused = True
+
+                log.warning(
+                    "RCON reconnected to %s tcp/%s (attempt %d/%d)%s",
+                    self.address, self.tcp_port, attempt, retries,
+                    " — game paused" if pause_after else "",
+                )
+                return
+            except Exception as e:
+                log.warning(
+                    "RCON reconnect attempt %d/%d failed: %s", attempt, retries, e
+                )
+
+        raise RuntimeError(
+            f"Could not reconnect RCON to {self.address}:{self.tcp_port} "
+            f"after {retries} attempts."
+        )
 
     def initialise(
         self, fast=True, all_technologies_researched=True, clear_entities=True
@@ -402,6 +452,8 @@ class FactorioInstance:
             "recipe_fluid_connection_mappings",
             "serialize",
             "serialize_direction_fix",
+            "tick_dispatcher",
+            "td_events",
         ]
         for script_name in init_scripts:
             self.lua_script_manager.load_init_into_game(script_name)
@@ -437,7 +489,6 @@ class FactorioInstance:
         lua_response = self.rcon_client.send_command(
             f"/sc rcon.print(dump(storage.get_alerts({seconds})))"
         )
-        # print(lua_response)
         alert_dict, duration = _lua2python("alerts", lua_response, start=start)
         if isinstance(alert_dict, dict):
             alerts = list(alert_dict.values())

@@ -254,13 +254,7 @@ async def render_at(center_x: str, center_y: str, radius: int = 32) -> ImageCont
                 "Failed to render: Game state not properly initialized or player entity invalid"
             )
 
-        # Convert to base64
-
-        # buffer = io.BytesIO()
-        # img.save(buffer, format='PNG')
-        # img_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
         content = Image(data=img._repr_png_(), format="png").to_image_content()
-        # return f"data:image/png;base64,{img_data}"
         return content
 
     except Exception as e:

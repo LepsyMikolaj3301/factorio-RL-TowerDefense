@@ -166,11 +166,20 @@ class ComposeGenerator:
         if not save_file_name.lower().endswith(".zip"):
             raise ValueError(f"Save file '{save_file}' is not a zip file.")
 
-        # Check that the zip contains a level.dat file
+        # Accept Factorio 1.x (level.dat) and 2.x (level.dat0, level.dat1, ...)
         with zipfile.ZipFile(save_file, "r") as zf:
-            if "level.dat" not in zf.namelist():
+            names = zf.namelist()
+            has_level = any(
+                n == "level.dat"
+                or n.endswith("/level.dat")
+                or n == "level.dat0"
+                or n.endswith("/level.dat0")
+                for n in names
+            )
+            if not has_level:
                 raise ValueError(
-                    f"Save file '{save_file}' does not contain a 'level.dat' file."
+                    f"Save file '{save_file}' does not look like a Factorio save "
+                    "(no level.dat or level.dat0 found)."
                 )
 
         shutil.copy2(save_file, save_dir / save_file_name)
@@ -339,7 +348,35 @@ class ClusterManager:
                 listening.append(f"tcp/{tcp_port}")
         return listening
 
-    def start(self, num_instances, scenario, attach_mod=False, save_file=None):
+    def _resolve_save_file(self, scenario, save_file, generate):
+        """Resolve the save file to load, applying the tower_defense default.
+
+        tower_defense REQUIRES a predefined save — map generation is not
+        supported, so ``--generate`` is rejected. If no ``save_file`` is given,
+        fall back to ``data/saves/tower_defense.zip`` (relative to the caller's
+        cwd) and error if it is missing.
+        """
+        if scenario == "tower_defense":
+            if generate:
+                raise SystemExit(
+                    "Error: tower_defense requires a predefined save; --generate "
+                    "is not supported. Pass --save-path <file> or place your "
+                    "authored map at data/saves/tower_defense.zip."
+                )
+            if not save_file:
+                default_save = Path.cwd() / "data" / "saves" / "tower_defense.zip"
+                if not default_save.exists():
+                    raise SystemExit(
+                        f"Error: default tower_defense save not found at {default_save}.\n"
+                        "Place your authored map there or pass --save-path <file>."
+                    )
+                return str(default_save.resolve())
+            return str(Path(save_file).expanduser().resolve())
+        # Non-tower_defense, or explicit --generate: honor an explicit save if given.
+        return str(Path(save_file).expanduser().resolve()) if save_file else None
+
+    def start(self, num_instances, scenario, attach_mod=False, save_file=None, generate=False):
+        save_file = self._resolve_save_file(scenario, save_file, generate)
         listening = self._find_port_conflicts(num_instances)
         if listening:
             print("Error: Required ports are in use:")
@@ -416,13 +453,14 @@ class ClusterManager:
         print(out)
 
 
-def start_cluster(num_instances, scenario, attach_mod=False, save_file=None):
+def start_cluster(num_instances, scenario, attach_mod=False, save_file=None, generate=False):
     manager = ClusterManager()
     manager.start(
         num_instances=num_instances,
         scenario=scenario,
         attach_mod=attach_mod,
         save_file=save_file,
+        generate=generate,
     )
 
 

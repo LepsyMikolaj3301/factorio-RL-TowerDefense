@@ -135,11 +135,12 @@ storage.utils.avoid_entity = function(player_index, entity, position, direction)
     return false
 end
 
-storage.crafting_queue = {}
+storage.crafting_queue = storage.crafting_queue or {}
 
-script.on_event(defines.events.on_tick, function(event)
-  -- Iterate over the crafting queue and update the remaining ticks
-  for i, task in ipairs(storage.crafting_queue) do
+storage.actions.update_crafting_queue = function(event)
+  -- Iterate backwards so removing completed tasks cannot skip the next entry.
+  for i = #storage.crafting_queue, 1, -1 do
+    local task = storage.crafting_queue[i]
     task.remaining_ticks = task.remaining_ticks - 1
 
     -- If the crafting is finished, consume the ingredients, insert the crafted entity, and remove the task from the queue
@@ -151,7 +152,7 @@ script.on_event(defines.events.on_tick, function(event)
       table.remove(storage.crafting_queue, i)
     end
   end
-end)
+end
 
 -- Utility function to ensure a valid character exists for a given player index
 -- Call this before any operation that needs the character
